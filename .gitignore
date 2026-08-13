@@ -1,0 +1,35 @@
+# Keil MDK 中间产物（编译生成的，不要提交）
+*.o
+*.d
+*.crf
+*.iex
+*.htm
+*.map
+*.lst
+*.dep
+*.axf
+*.hex
+*.bin
+*.elf
+*.lnp
+*.sct
+*.ini
+*.dbgconf
+*.bak
+*.plg
+*.uvguix.*
+*.uvgui.*
+*.scvd
+JLinkLog.txt
+build/
+DebugConfig/
+ReleaseConfig/
+*.user
+
+# CubeMX 临时文件
+*.ioc.bak
+
+# Qt 编译产物（后面 D10 用 Qt 时生效）
+*.user
+*.pro.user
+build-*/
