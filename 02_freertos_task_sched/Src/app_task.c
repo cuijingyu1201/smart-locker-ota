@@ -6,6 +6,7 @@
 #include <stdio.h>
 
 /* ======================== TaskLED ======================== */
+//实现LED翻转
 void TaskLED(void *argument)
 {
     (void)argument;
@@ -20,6 +21,7 @@ void TaskLED(void *argument)
 }
 
 /* ======================== TaskPrint ======================== */
+//调试验证，栈溢出，系统时间是否正常，任务数量是否异常
 void TaskPrint(void *argument)
 {
     (void)argument;

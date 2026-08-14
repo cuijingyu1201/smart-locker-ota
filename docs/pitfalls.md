@@ -82,3 +82,107 @@
 - n_tasks=4（TaskLED + TaskPrint + Idle + Timer Service）
 - 编译 0 Error 0 Warning，运行稳定无 HardFault
 
+---
+
+# D3：FreeRTOS 4 大 IPC（2026-08-14）
+
+## 坑1：编译时间戳不变（串口 Build 行日期时间永远是旧的）
+
+- **现象**：改了业务代码 → 按 F7 编译 → 下载烧录 → 打开串口看 Build: 行，日期时间和上一次一模一样，以为新代码没烧进去。
+- **根因**：`__DATE__` 和 `__TIME__` 是 **C 编译器内置的编译期宏**，只有**包含它们的那个源文件（这里是 main.c）被重新编译时**才会被替换成新的值。Keil 默认按 F7 是「增量编译 Build Target」—— 增量编译只会重编「修改时间比 .o 文件新」的源文件。如果 main.c 没改动，Keil 就跳过它不重编，所以 `__DATE__` / `__TIME__` 永远是旧的。
+- **重点区分两个「时间戳」问题（不要混为一谈）**：
+  - **Build 时间戳不变** = 编译期问题，和程序逻辑完全没关系；解决方法是「强制 main.c 重编」。
+  - **rtos_tick 不再增长** = 运行期卡死 / HardFault，和编译没关系；解决方法是「排查任务栈溢出 / 状态机崩溃」。
+- **解决**（任选一种）：
+  1. 需要新 Build 时间戳时，Keil 菜单 **Project → Rebuild all target files**（全量重编所有源文件）。
+  2. 或先 **Project → Clean Targets** 删除所有 .o，再按 F7（效果同上）。
+  3. 最简单：main.c 里随便打个空行保存 → 再 F7，Keil 检测到 main.c 修改时间变了就会重编。
+- **教训**：Keil F7 = 增量编译（只会重编改过的文件）。`__DATE__`、`__TIME__`、`__FILE__` 这类编译期宏，一定要对应源文件被重编才会更新。
+
+## 坑2：rtos_tick 运行期卡死（系统 HardFault / 调度器状态机崩溃）
+
+- **现象**：TaskLED 打印到一半（比如 `[TASK_LED ] rtos_tick=14895` 之后不再继续），LED 停止闪烁，按任何按键没反应，串口再也没有新输出。
+- **根因排查过程（二分法定位）**：
+  1. 先把 TaskLED 砍到只剩「2 行翻转 + 1 行 osDelay」，能稳定 500ms 闪，说明调度器本身没问题。
+  2. 第一次加 `uart_printf_mutex`（带 buf[256] + vsnprintf 版本）→ 立刻卡死。根因：TaskLED 的栈(256 words / 1024B) 被 vsnprintf + buf[256] 吃了 600B 以上，栈底的 canary 被踩 → `STACK OVERFLOW in task 'TaskLED'` 或 huart1 句柄被损坏后 `HAL_UART_Transmit` 死等 TXE。
+  3. 去掉 vsnprintf，换回裸 `printf` + 互斥锁，又出现卡死。根因：TaskSemHandle 优先级 = 40（High，最高），ISR give 信号量后立刻抢占正在打印的 TaskLED(prio=24)，两个任务在 fputc 里争抢同一个互斥锁 → 每个字符(87μs@115200) 都触发一次 PendSV 上下文切换 → 调度器内部链表耗到最终状态错乱，系统挂死。
+- **解决**：
+  1. 凡是要调 `printf` 的任务，栈大小至少 384 words（vsnprintf 版本至少 512 words）。永远用 `uxTaskGetStackHighWaterMark(NULL)` 的结果来判断要不要加栈：< 20 words 就必须加。
+  2. **ISR 触发的高优先级任务（信号量延迟处理任务）绝对不能调 printf / HAL_UART_Transmit / osMutexAcquire(长 timeout)**—— 这些操作在高优先级里会把调度器耗死。只做「写全局变量」的操作，几微秒就结束，立刻重新阻塞等下一次信号量。
+- **教训**：运行期卡死 = 任务栈 / 调度器 / 外设状态机 三类问题之一。用二分法往回删代码（先砍新写的 IPC → 再砍 printf → 最后砍到只剩 3 行翻转+osDelay），先让最小功能稳定跑，再一行行加回去，100% 能定位到根因。
+
+## 坑3：互斥锁实现的两次迭代（uart_printf_mutex → 放到 fputc 里）
+
+### 第 1 版（有问题，被淘汰）：上层加锁 + vsnprintf + buf[256]
+
+```c
+void uart_printf_mutex(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char buf[256];                                 // ← 256B 局部变量
+    int len = vsnprintf(buf, sizeof(buf), fmt, args); // ← vsnprintf 格式化
+    va_end(args);
+
+    if (osMutexAcquire(g_uart_mutex_handle, 100) == osOK) {
+        HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 0xFFFF);
+        osMutexRelease(g_uart_mutex_handle);
+    }
+}
+```
+
+- **致命缺陷 1：吃栈太深**。单次调用栈深度 ≈ 256B(buf) + 200B(vsnprintf 内部) + 50B(va_list/参数) ≈ 500B。TaskLED 256 words(1024B) 勉强够但踩 canary，TaskSemHandle 128 words(512B) **调一次直接爆栈卡死**。
+- **致命缺陷 2：调用方全局替换容易漏**。必须所有任务把 printf 改成 uart_printf_mutex，漏一个任务没改（比如 IdleHook 或钩子函数里的 printf）→ 两个任务一个走互斥锁、一个直接走裸 HAL_UART_Transmit → 打印乱码+冲突卡死概率指数上升。
+
+### 第 2 版（最终采用）：互斥锁下沉到 fputc（重定向函数最底层）
+
+main.c 的 fputc 重定向代码改成：
+
+```c
+#ifdef __GNUC__
+  #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+#else
+  #define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+#endif
+PUTCHAR_PROTOTYPE {
+    /* 互斥锁没创建好（启动阶段）就跳过加锁，避免死锁 */
+    if (g_uart_mutex_handle != NULL) {
+        osMutexAcquire(g_uart_mutex_handle, 100);
+    }
+    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
+    if (g_uart_mutex_handle != NULL) {
+        osMutexRelease(g_uart_mutex_handle);
+    }
+    return ch;
+}
+```
+
+### 第 2 版的 4 个优点
+1. **上层零改动**：所有任务、钩子函数、初始化代码都继续写裸 `printf(...)`，不用全局替换 → 永远不会漏改某个 printf 导致冲突。
+2. **栈占用砍掉 600B**：没有 buf[256] 局部变量，也不调 vsnprintf，每个字符的栈深度只有函数调用开销（几十字节），任务爆栈概率大幅降低。
+3. **兼容启动阶段**：`g_uart_mutex_handle != NULL` 判断——App_IPC_Init 之前（启动信息打印时互斥锁还没建）不加锁直接发；创建好之后自动加锁。这就避免了「锁是 NULL 还去 acquire」死锁。
+4. **粒度虽然按字符但足够用**：115200 波特率下 1 个字符只要 87μs，即使 87μs 被切换一次也不会乱日志（反正一次只会被切走一个字符，下次切回来继续发剩下的，串口字节流顺序天然正确）。
+
+- **教训**：共享资源（USART1 外设、I2C 总线、SPI Flash 等）的互斥锁永远是**越靠近底层驱动越可靠**。放在 fputc 这种最底层比上层每个调用者自己写一套加锁逻辑简单、安全、省栈。
+
+## 坑4：WK_UP 按键随机卡死 / EXTI 中断触发系统崩溃
+
+- **现象**：不按按键跑 10 分钟都不崩，连续快速按 WK_UP 5~10 次后系统 100% 卡死（rtos_tick 停、LED 停、按键没反应）。
+- **根因 1（直接死因）**：TaskSemHandle 优先级 = osPriorityHigh(40，**所有用户任务里最高**)，ISR 里 `xSemaphoreGiveFromISR + portYIELD_FROM_ISR` 会让 TaskSemHandle 在 ISR 返回瞬间立刻抢占正在执行的任务。如果当时 TaskLED(prio=24) 正在 `printf → fputc → osMutexAcquire` 的中间，刚拿到锁还没放 → TaskSemHandle 又调 `printf → fputc → osMutexAcquire` → 同一个锁在两个任务间来回 PendSV 切几十次 → 调度器状态机被高频切换拖崩。
+- **根因 2（放大器）**：机械按键按下瞬间金属触点弹跳 5~20ms，期间会产生 ~20 次下降沿 → EXTI0 中断连发 20 次 → 每次都 Give 信号量 + 请求调度 → 相当于 1 次按键把系统强行 PendSV 切 20 次，本来能正常跑的系统在这个峰值下被冲垮。
+- **解决**（3 条同时上，1 条都不能漏）：
+  1. **TaskSemHandle 绝对不调 printf / HAL_UART_Transmit**。只做两件事：拿到信号量 → 防抖判断通过后写全局变量 `g_irq_cnt++` → 重新 `osSemaphoreAcquire(osWaitForever)` 阻塞。几微秒跑完立刻挂起，绝不抢 CPU。
+  2. **防抖逻辑放到任务里，不放 ISR 里**。TaskSemHandle 里用 `now - last_tick < 50 → continue` 过滤抖动。ISR 里只调 Give，不要做任何 tick 读取 / 计数 / 判断——xTaskGetTickCountFromISR 虽然说是 FromISR 安全，但改 BASEPRI 的方式和 FreeRTOS 内核临界区叠加时偶尔会出 Bug，能不用就不用。
+  3. **irq_cnt 的打印统一交给 TaskPrint 每 1 秒统计一次**。这种「按了几次按键」的信息完全没有实时性要求，不需要按键瞬间就打出来，一秒打一次统计值绰绰有余。
+- **教训**：**ISR 和它唤醒的高优先级任务，代码永远遵循「最少操作原则」**——能写全局变量就不调函数，能不做判断就不做判断，能不打印就绝对不打印。任何耗时/阻塞/拿锁操作统统甩回最低优先级的任务慢慢做。
+
+## D3 成果
+- 4 大 IPC 全部接入并实测通过：
+  - **Queue（消息队列）**：TaskLED 生产者 → TaskPrint 消费者，传递 LED 翻转 tick 和状态；队列深度 10 条；timeout=0 策略（队列满直接丢旧样本，LED 这种状态型信号的正确做法）。
+  - **Mutex（互斥锁）**：下沉到 fputc 重定向函数里；全局裸 printf 线程安全；启动信息阶段自动跳过未初始化锁；串口日志完整无交错。
+  - **EventGroup（事件组）**：BIT_KEY_DOWN=1 表示 WK_UP 按住；TaskLED osEventFlagsWait(timeout=0) 查位后选择 100ms 快闪 / 500ms 慢闪；松开立刻恢复。
+  - **BinarySemaphore（二值信号量）**：EXTI0 下降沿中断（WK_UP 按下）→ Give 信号量 → TaskSemHandle 唤醒 + 50ms 防抖 → g_irq_cnt++，TaskPrint 每秒统计打印。
+- 系统总任务数 `n_tasks=6`：TaskLED(24)、TaskPrint(16)、TaskKeyPoll(32)、TaskSemHandle(40)、Idle Task(0)、Timer Service Task(31)。
+- 所有任务栈剩余（uxTaskGetStackHighWaterMark）≥ 48 words，无栈溢出风险。
+- 压力测试：连续按 WK_UP 20+ 次、按住 3 秒不松手、系统跑 5 分钟 → 均无 HardFault / 卡死，调度器稳定运行。
+- 按键消抖：`irq_cnt` 按一次只递增 1（按 10 次 irq_cnt 增长 8~10 次，偶尔漏 1 次是消抖窗口 50ms 刚好卡边界，正常现象）。
