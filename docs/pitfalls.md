@@ -327,3 +327,28 @@ WiFi 连接 + TCP 客户端建立 + 每 5 秒 JSON 上报全部验证通过。
 系统总任务数 n_tasks=8：TaskLED、TaskPrint、TaskKeyPoll、TaskSemHandle、TaskDHT11、TaskESP8266、Idle Task、Timer Service Task。
 NetAssist TCP Server 端稳定接收 {"temp":26,"humi":74,"tick":12150,"uptime":12} 格式 JSON。
 编译 0 Error 0 Warning，连续运行稳定无 HardFault。
+
+
+
+# D5 踩坑记录
+
+D5：ESP8266 建立 TCP 连接，验证网络通路（2026-08-16）
+阶段归属：阶段2 网络通信 ·
+
+---
+
+## D5 成果
+
+- D4→D5 工程复制 + CubeMX GENERATE CODE 流程跑通，工程名和内部引用全部正确更新为 `05_tcp_connect_verify`。
+- ESP8266 能主动建立 TCP 连接到电脑 NetAssist（TCP Server，端口 1883）：
+  - 串口日志能看到 `AT+CIPSTART=TCP,IP,1883 → CONNECT → OK` 完整链路。
+  - NetAssist 侧看到 `Client xxx.xxx.xxx.xxx:xxxxx connected` 接入提示。
+- TCP 双向通路验证通过：
+  - **上行（ESP→电脑）**：NetAssist 每 5 秒收到一行 `{"temp":25,"humi":74,"tick":xxxxx,"uptime":xx}` 格式 JSON。
+  - **下行（电脑→ESP）**：NetAssist 发送框输入字符串发送后，串口立刻打印 `[ESP8266] RX: xxxx`，证明 USART2 RX 中断→环形缓冲→轮询解析链路完整无丢。
+- 3 项压力测试通过：
+  - 连续跑 5 分钟：JSON 上报不间断，连接不丢。
+  - 路由器断电 10 秒再插回：30 秒内自动 RESET→重连 WiFi→重连 TCP→恢复上报。
+  - 关闭 NetAssist 再重新打开：ESP8266 检测到 CLOSED→RECONNECT→重新接入→恢复上报。
+- 系统总任务数 n_tasks=8，所有任务栈剩余 ≥ 20 words，无 HardFault / 栈溢出风险。
+- Checkpoint 全部通过，具备进入 D6（MQTT 协议封装 + 公网 Broker 联调）的条件。
