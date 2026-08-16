@@ -186,3 +186,144 @@ PUTCHAR_PROTOTYPE {
 - 所有任务栈剩余（uxTaskGetStackHighWaterMark）≥ 48 words，无栈溢出风险。
 - 压力测试：连续按 WK_UP 20+ 次、按住 3 秒不松手、系统跑 5 分钟 → 均无 HardFault / 卡死，调度器稳定运行。
 - 按键消抖：`irq_cnt` 按一次只递增 1（按 10 次 irq_cnt 增长 8~10 次，偶尔漏 1 次是消抖窗口 50ms 刚好卡边界，正常现象）。
+
+
+
+
+D4：WiFi + DHT11 + TCP 数据上报（2026-08-15 ~ 2026-08-16）
+##坑1：Native FreeRTOS 与 CMSIS-RTOS V2 API 混用导致链接错误（L6218E）
+现象：编译链接阶段报错 Error: L6218E: Undefined symbol xSemaphoreGiveFromISR (referred from main.o)，1 Error 0 Warning，无法生成 .axf。
+根因：CubeMX 配置的 FreeRTOS 接口是 CMSIS_V2，工程只编译了 cmsis_os2.c，没有包含 Native FreeRTOS 的 semphr.c。但 main.c 的 HAL_GPIO_EXTI_Callback 中断回调里直接调了 Native API xSemaphoreGiveFromISR()，链接器在全工程找不到该符号的实现 → 报 undefined。
+排查过程：
+看错误信息 referred from main.o → 锁定问题在 main.c。
+搜索 xSemaphoreGiveFromISR → 只在 EXTI 回调里出现一次。
+对比 freertos.c 里其他任务用的都是 osSemaphoreRelease()（CMSIS_V2）→ 确认是 API 混用。
+检查 Middlewares 目录 → 只有 CMSIS_RTOS_V2/cmsis_os2.c，没有 semphr.c → 确认 Native API 没被编译进去。
+解决：把 main.c 中断回调里的 xSemaphoreGiveFromISR(g_irq_sem_handle, NULL) 替换为 CMSIS_V2 的 osSemaphoreRelease(g_irq_sem_handle)。CMSIS_V2 的 osSemaphoreRelease 内部会自动判断是否在 ISR 上下文，ISR 和任务里都能安全调用。
+教训：一个工程中要么全用 Native FreeRTOS API（xTaskCreate、xSemaphoreGive、xQueueSend），要么全用 CMSIS_V2（osThreadNew、osSemaphoreRelease、osMessageQueuePut），绝对不能混用。判断标准：CubeMX → FREERTOS → Interface 选的是 CMSIS_V2 就全用 os* 前缀函数。抄网上代码时第一件事就是把 Native API 翻译成 CMSIS_V2 等价接口。
+##坑2：AT 指令状态机重试逻辑只发一次，超时后不重发
+现象：ESP8266 状态机进入 AT_TEST 后，串口只打印一次 [ESP8266] 进入 AT_TEST (retry=0)，之后即使超时 5 次，retry_cnt 永远停在 0，AT 指令不会重发，最终直接跳 RECONNECT。
+根因：所有状态（AT_TEST / SET_STA / JOIN_WIFI / CONN_TCP）的重试逻辑都写成：
+
+if (retry_cnt == 0) {        // 只在 retry_cnt==0 时发送
+    ESP8266_SendRaw("AT\r\n", 4);
+    retry_cnt++;              // 变成 1
+}
+// ... 等待信号量超时 ...
+第一次进入时 retry_cnt=0 → 发送 AT → retry_cnt 变 1。超时后重新进入 case，retry_cnt 是 1 不是 0 → if 条件不成立 → AT 不重发，但 retry_cnt 也不自增 → 死锁在"不发指令也不计数"的状态。
+排查过程：
+串口日志只有一次 进入 AT_TEST (retry=0)，没有 retry=1/2/3 → 说明循环在跑但 retry_cnt 没增长。
+读代码发现 retry_cnt++ 写在 if (retry_cnt == 0) 里面 → 只有第一次进 if 时才自增。
+超时分支只改 state 不重发指令 → 确认重试和重发脱节。
+解决：去掉 if (retry_cnt == 0) 判断，让每次循环都重发指令 + 计数自增：
+
+case ESP_STATE_AT_TEST:
+    ESP8266_ClearRxBuf();              // 每次清空
+    ESP8266_SendRaw("AT\r\n", 4);      // 每次都发
+    retry_cnt++;                        // 每次都计数
+    // ... 轮询等待回复 ...
+    if (retry_cnt >= 5) { state = ESP_STATE_RECONNECT; }
+4 个状态（AT_TEST / SET_STA / JOIN_WIFI / CONN_TCP）全部做同样修改。
+教训：重试逻辑的核心原则是**"重试计数"和"重发指令"必须绑定在同一个代码路径里**。推荐用"每次循环都发 + 计数判超时"的写法，比"进入时发一次 + 超时判重发"更不容易出错——后者要求超时分支里也写一遍发送逻辑，很容易漏。
+##坑3：ESP8266 冷启动期间发 AT 指令石沉大海
+现象：TaskESP8266 一启动就调 ESP8266_StartReceiveIT() + 发 AT\r\n，ESP8266 完全无反应，串口收不到任何回显和回复。偶尔能收到 busy p...（busy processing）。
+根因：ESP8266-12F 模块冷启动（上电）需要 2-3 秒完成内部初始化流程：LDO 稳定 → CH340 初始化 → 射频校准 → 加载 AT 固件 → 串口就绪。在这期间收到的串口数据会被直接丢弃。代码在 osKernelStart() 后立刻运行 TaskESP8266，此时 ESP8266 可能才刚上电几百毫秒，AT 指令全丢了。
+排查过程：
+先怀疑接线问题 → 用 USB-TTL 单独接 ESP8266 手动发 AT → 回复 OK → 接线没问题。
+怀疑波特率 → 单独测试 115200 能通 → 波特率没问题。
+对比"单独测试 OK"和"STM32 上跑不通"的唯一区别 → STM32 上电后立刻发 AT，没有等待。
+查 ESP8266 数据手册启动时序 → 冷启动需要 2-3 秒 → 确认是启动时序问题。
+解决：TaskESP8266 开头加启动延时：
+
+printf("[ESP8266] Waiting for module boot (3s)...\r\n");
+osDelay(3000);   // 等 ESP8266 冷启动完成
+ESP8266_StartReceiveIT();
+教训：任何带独立 MCU 的外设模块（ESP8266、蓝牙模块、OLED、DHT11）上电后都有启动稳定期。上电后先延时再发指令是嵌入式系统的通用规则。常见启动时间：ESP8266=2-3s、DHT11=1-2s、OLED=100-200ms。不确定就查数据手册的 Power-on Timing 图。
+##坑4：二值信号量遇回显换行提前唤醒，永远读不到 OK
+现象：串口只打印 [ESP8266] RX: AT（回显），永远看不到 OK。每次都是等信号量超时后进入 RECONNECT，AT 测试永远过不了。
+根因：USART2 中断回调里遇到 \n 就释放信号量。但 ESP8266 对 AT 指令的完整回复是两段：
+
+回显：AT\r\n       ← 第 1 个 \n，信号量立刻释放！Task 被唤醒
+回复：OK\r\n       ← 第 2 个 \n
+TaskESP8266 被回显的 \n 唤醒后，调 ESP8266_GetLine() 读出 AT\n，判断没有 OK → 调 ESP8266_ClearRxBuf() 清空缓冲 → 后面到达的 OK\r\n 直接被清掉，永远读不到。
+排查过程：
+用 USB-TTL 单独抓 ESP8266 的 TX 脚 → 确认 ESP8266 确实回复了 AT\r\nOK\r\n 两段。
+对比 STM32 串口日志 → 只有 RX: AT 没有 RX: OK → 怀疑 OK 被清掉了。
+读代码发现 ESP8266_GetLine() 读完后立刻 esp_rx_wr_idx = 0（清空）→ 确认 OK 到达时缓冲已经被清。
+读中断回调 → 发现 \n 就 Give 信号量 → 回显的 \n 也会触发 → 确认是"回显换行提前唤醒"问题。
+解决：废弃"信号量唤醒 + 单次 GetLine"机制，改成主动轮询缓冲区：
+
+case ESP_STATE_AT_TEST:
+    ESP8266_ClearRxBuf();
+    ESP8266_SendRaw("AT\r\n", 4);
+    retry_cnt++;
+    {
+        uint32_t wait_start = osKernelGetTickCount();
+        int found_ok = 0;
+        while ((osKernelGetTickCount() - wait_start) < 1000)  // 1 秒总超时
+        {
+            osDelay(50);                                        // 每 50ms 轮询一次
+            if (ESP8266_GetLine(line, sizeof(line)) > 0) {
+                printf("[ESP8266] RX: %s", line);
+                if (strstr(line, "OK") != NULL) {
+                    found_ok = 1;
+                    break;                                      // 真正找到 OK 才退出
+                }
+            }
+        }
+        if (found_ok) { /* 进入下一状态 */ }
+    }
+中断回调只负责往环形缓冲写字节，不再给信号量。任务用 50ms 间隔轮询 GetLine()，直到读到 OK 或超时。
+教训：用信号量做串口协议解析时，必须明确**"一次完整交互 = 一次信号量"**。如果一次 AT 回复包含多个 \n（回显 + 状态 + OK），用二值信号量会在第一个 \n 就唤醒任务，后续数据被清掉。更稳妥的方案是：中断只写缓冲，任务用轮询 + 超时解析协议，代码更简单且不会漏事件。
+##坑5：ESP8266 回复 busy processing，指令被拒绝
+现象：AT 指令能收到回显，但 ESP8266 回复 busy p...（busy processing...），意思是"我正忙着处理上一条指令，别发了"。每隔几秒出现一次，AT 测试反复失败。
+根因（双重原因）：
+启动延时不够：3 秒有时不够 ESP8266-12F 完全启动，模块还在初始化就收到了 AT。
+指令发送太密：重试逻辑改成"每次循环都重发"后，如果上一条 AT 还没处理完，下一条又来了 → ESP8266 回 busy。
+排查过程：
+串口看到 busy p... → 查 ESP8266 AT 指令手册 → busy processing 表示"模块忙，拒绝处理新指令"。
+分析时间线：发 AT → 50ms 后轮询 → 没收到 OK → 下一轮循环立刻又发 AT → ESP8266 还在处理第一条 → busy。
+对比启动阶段：模块刚上电时内部初始化也需要 CPU 时间 → 3 秒延时期间如果发 AT 也会 busy。
+解决：
+启动延时从 3 秒增加到 5 秒。
+每次发完 AT 指令后先 osDelay(300) 等 ESP8266 回复完整，再开始轮询。
+轮询中遇到 busy 就 osDelay(500) 多等一会儿，不急着重试：
+
+if (strstr(line, "busy") != NULL) {
+    osDelay(500);   // busy 了就多等 500ms
+}
+教训：AT 指令交互有节奏要求，不能"发完立刻循环重发"。正确节奏是：发指令 → 延时 200-500ms → 轮询读回复 → 判断结果。常见 AT 指令典型响应时间：AT/OK=100ms、AT+CWMODE=200ms、AT+CWJAP（WiFi连接）=3-10s、AT+CIPSTART（TCP连接）=1-5s。遇到 busy 就加等待，不要硬冲。
+##坑6：误判 WIFI DISCONNECT 为连接失败，WiFi 连上就断
+现象：ESP8266 发 AT+CWJAP 连接 WiFi，串口收到 WIFI DISCONNECT 后代码立刻判失败进入 RECONNECT。但 WiFi 路由器端能看到 ESP 确实连上了，只是马上又断开，反复循环。
+根因：ESP8266 连接 WiFi 的完整且正常的流程是三步：
+
+WIFI DISCONNECT    ← ① 先断开旧连接（正常中间状态！不是失败！）
+WIFI CONNECTED      ← ② 正在连接 AP
+WIFI GOT IP         ← ③ DHCP 获取 IP，连接成功
+代码在第 ① 步就把 WIFI DISCONNECT 当失败信号判死了，直接进 RECONNECT 打断正在进行的连接。3 秒后重新发 CWJAP → 又断开旧连接 → 又判失败 → 无限循环。WiFi 路由器侧看到的就是"连上就断"。
+排查过程：
+串口日志显示收到 WIFI DISCONNECT 后立刻 WiFi join FAIL! → 怀疑误判。
+用 USB-TTL 单独抓 ESP8266 TX → 手动发 CWJAP → 完整回复是 WIFI DISCONNECT → WIFI CONNECTED → WIFI GOT IP → OK 四段。
+对比代码 → 发现 WIFI DISCONNECT 被放在失败判断条件里 → 确认是误杀正常中间状态。
+WiFi 路由器端确认 ESP 能连上 → 排除密码/网络问题 → 纯代码逻辑 Bug。
+解决：只把真正的失败信号判失败，去掉 WIFI DISCONNECT：
+
+// 修改前（误杀中间状态）
+if (strstr(line, "WIFI DISCONNECT") != NULL ||
+    strstr(line, "ERROR") != NULL)
+
+// 修改后（只判真正的失败）
+if (strstr(line, "FAIL") != NULL ||
+    strstr(line, "+CWJAP:1") != NULL ||   // 密码错误
+    strstr(line, "+CWJAP:2") != NULL ||   // 找不到 AP
+    strstr(line, "+CWJAP:3") != NULL ||   // 连接超时
+    strstr(line, "ERROR") != NULL)
+// WIFI DISCONNECT / WIFI CONNECTED 是中间状态，继续等 WIFI GOT IP
+教训：写协议状态机前，一定先用串口手动发一遍指令，把完整的回复序列打印出来研究清楚，不要脑补"我觉得什么是失败"。ESP8266 AT 指令手册明确列出了每个指令的 URC（主动上报）消息，哪些是中间状态、哪些是失败信号要逐一确认。最稳妥的原则：只把"明确标注 FAIL/ERROR 的响应"判失败，其余都继续等超时。
+##D4 成果
+DHT11 温湿度传感器驱动完成：DWT 微秒延时 + 单总线时序 + 校验和验证，2 秒采样周期，mutex 保护数据读写。
+ESP8266 AT 指令驱动完成：USART2 中断接收 + 环形缓冲 + 状态机（INIT→AT_TEST→SET_STA→JOIN_WIFI→CONN_TCP→WORKING→RECONNECT）。
+WiFi 连接 + TCP 客户端建立 + 每 5 秒 JSON 上报全部验证通过。
+系统总任务数 n_tasks=8：TaskLED、TaskPrint、TaskKeyPoll、TaskSemHandle、TaskDHT11、TaskESP8266、Idle Task、Timer Service Task。
+NetAssist TCP Server 端稳定接收 {"temp":26,"humi":74,"tick":12150,"uptime":12} 格式 JSON。
+编译 0 Error 0 Warning，连续运行稳定无 HardFault。
