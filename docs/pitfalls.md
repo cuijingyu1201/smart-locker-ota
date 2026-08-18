@@ -627,3 +627,47 @@ D7：掉线自动重连 + MQTT 互斥锁加固 + 下行 PUBLISH 解析（2026-08
 - **协议层新增 3 个函数**：`MQTT_BuildConnect_Resume`（CleanSession=0）、`MQTT_ParsePublish`（解析 PUBLISH 报文）、`MQTT_FindPublishFrame`（搜索 PUBLISH 帧头，保留但不再作为主解析方案）。
 - **所有 D7 验证项通过**：首次连接 CleanSession=1、掉线重连 CleanSession=0、LED 远程开关、report 立即上报、互斥锁并发不死机。
 - 具备进入 D8（JSON 解析库接入 + 多命令扩展）的条件。
+
+
+
+
+
+D8：Bootloader 基础框架开发 + Flash 三分支状态机（2026-08-19）
+阶段归属：阶段3 OTA系统架构 · Bootloader层
+
+
+## 坑1：验证跳转APP时死机，D7 工程 IROM1 起始地址没手动改成 0x08008000
+
+- **现象**：Bootloader 烧录进去，D7（APP）也烧录进去，按 Reset 后串口打印了 `[BOOT] APP valid, jumping to 0x08008000...`，然后板子立刻死机（LED0不亮，串口无任何输出，看门狗不复位）。Bootloader 本身工作正常（KEY0进IAP、APP无效慢闪都正常），问题只出在"跳转APP"这一步。
+- **根因**：CubeMX 新建 STM32F103ZET6 工程时，IROM1 的默认配置是 `Start=0x08000000，Size=0x00080000`（整个512KB Flash 都给 APP）。现在 Bootloader 占了前 32KB（0x08000000~0x08007FFF），APP 必须从 0x08008000 开始，**但 Keil/CubeMX 不会知道你有一个 Bootloader，它不会自动帮你把 APP 的链接地址往后挪 32KB**。如果 D7 的 IROM1 还是默认值 0x08000000，会发生两个致命问题：
+  1. **向量表放错位置**：APP 的向量表（MSP、Reset_Handler、中断服务函数地址表）被链接器放在了 0x08000000，而不是 0x08008000。Bootloader 的 JumpToApp 函数读 0x08008000 处的栈指针时，读的其实是 APP 向量表中间的某个字段（不是初始栈顶），值是非法地址，`__set_MSP` 设置了一个非法栈后，紧接着调用 APP 的 Reset_Handler 会立刻触发 HardFault。
+  2. **代码地址和跳转地址不匹配**：即使向量表侥幸对齐，APP里所有函数调用、全局变量引用都是基于 0x08000000 基址算出来的，而实际 APP 被烧录在 0x08008000，函数地址全部错位，CPU 跳到非法地址必死。
+- **排查过程**：
+  1. Bootloader 串口能正常打印 Banner，说明 Bootloader 的 USART1、GPIO、printf、时钟配置都没问题，故障点就在 JumpToApp 之后。
+  2. 串口成功打印了 `APP valid`，说明 `IsAppValid()` 函数通过了——`*(volatile uint32_t*)0x08008000` 读出来的高12位是 0x200。这里其实**已经埋下了误导**：如果 D7 的 IROM1 还是 0x08000000，那 APP 的向量表在 0x08000000，0x08008000 处是 APP 代码段中间某个字（恰好高12位也是 0x200，侥幸通过检查）。
+  3. 打开 D7 工程魔术棒 → Target → 看 IROM1：果然还是默认的 `Start=0x08000000，Size=0x00080000`，完全没改。
+  4. 确认根因：APP 的链接地址和实际烧录位置不匹配，向量表和函数调用地址全部错位。
+- **解决**：打开 D7 工程（07_mqtt_reconnect）手动改 IROM1，**改完必须 Rebuild（不是 Build）**：
+  ```
+  Options for Target → Target 选项卡 → Read/Only Memory Areas (ROM)
+      IROM1: Start = 0x08008000   （APP 从第 32KB 偏移开始，跳过 Bootloader 区）
+             Size  = 0x00074000   （464KB，0x80000 - 0x8000 = 0x74000，剩余全给 APP）
+  ```
+  Rebuild 完后，再烧录 D7 的 hex（方法1：Keil 直接 Load；方法2：ST-Link Utility 打开 hex，确认起始地址是 0x08008000 再 Program）。按 Reset 后，Bootloader 打印完 `jumping to 0x08008000...` 后，隔 2~3 秒会继续打印 D7 的 APP 启动日志 `========== FreeRTOS APP v1.0 ==========`，跳转成功。
+- **教训**：这是 Bootloader + APP 双工程结构里最经典、最容易踩的坑，90% 的初学者第一次做都会在这里死机几小时。核心意识是：**Keil 的 IROM1 配置决定了"链接器认为代码应该放在哪个地址"，它和"你实际把 hex 烧录到 Flash 的哪个地址"必须 100% 一致，差一个字节都不行。** CubeMX 默认的 IROM1 是按"整片 Flash 只有一个程序"设计的，只要你引入了 Bootloader 双工程架构，所有 APP 工程（D6、D7、后续所有阶段）的 IROM1 都要手动改成 0x08008000/0x00074000，**Keil 永远不会自动帮你改**。每次从 Dx 复制到 Dx+1 新建工程时，第一件事就是改 IROM1，不要等死机了再回头找。
+
+## D8 成果
+
+- **独立 Bootloader 工程搭建完成**：`00_bootloader` 工程基于 HAL 库、无 FreeRTOS（纯裸机状态机），Keil IROM1 配置为 `0x08000000 / 0x00008000`（仅占前 32KB），与 APP 区完全分离，互不覆盖。
+- **Flash 分区方案落地**：三块区域划分清晰，Bootloader（32KB:0x08000000-0x08007FFF）→ APP（464KB:0x08008000-0x0807EFFF）→ OTA 参数区（4KB:0x0807F000-0x08080000），为后续 D10（串口IAP）和 D12（WiFi OTA）预留了正确的地址边界。
+- **flash_if.c 四个 Flash 操作函数实现**：`FLASH_ErasePage`（按地址擦2KB页，擦前解锁擦后上锁）、`FLASH_WriteWord`（按4字节写）、`FLASH_WriteBuf`（按缓冲循环写，4字节对齐）、`FLASH_ReadWord`（直接指针读，无需解锁）。封装统一，D10/D12 写新固件时直接调用，不用重复写 Flash 解锁/上锁模板代码。
+- **jump_to_app.c 跳转框架实现**：`IsAppValid()` 校验 0x08008000 处的初始栈指针（高12位必须等于 0x200，即指向 RAM），避免跳到空白 Flash 区；`JumpToApp()` 严格按 6 步跳转（读MSP→读ResetHandler→关中断→清NVIC挂起标志→设VTOR→设MSP→跳转），保证 APP 向量表、中断状态、栈指针三者与 Bootloader 完全解耦，跳转后无残留中断触发。
+- **三分支状态机验证通过**：
+  - **分支1（OTA_FLAG）**：读 0x0807F000 匹配 0xA5A5A5A5 → 清除 FLAG，等 KEY0 进 Serial IAP。OTA_FLAG 写入逻辑由 D12 APP 端完成，D8 预留处理分支正确。
+  - **分支2（KEY0）**：上电后 100ms 内检测 KEY0 为低 → 打印 `KEY0 pressed! Serial IAP mode`，双 LED 每 200ms 快闪，标识进入 IAP 模式（D10 在此基础上加 Ymodem 接收）。
+  - **分支3（APP有效）**：APP 校验通过 → 打印 `APP valid, jumping to 0x08008000...`，200ms 后执行 JumpToApp，D7 FreeRTOS APP 正常启动，温湿度上报、MQTT 通信、LED 远程控制功能全部不受影响。
+  - **分支4（APP无效）**：APP 区全 0xFF（未烧录或写崩）→ 打印 `APP NOT valid!`，LED0 每 500ms 慢闪，提示用户按 KEY0 + Reset 进入 IAP 模式烧录固件。
+- **LED 状态编码体系建立**：通过 LED0/LED1 的组合快速判断当前模式，不用接串口也能排障——LED0亮+LED1灭=Bootloader运行中；LED0慢闪(500ms)=APP无效等固件；LED0+LED1快闪(200ms)=IAP模式；LED0灭+LED1慢闪(500ms)=已跳APP，TaskLED心跳。
+- **Bootloader printf 基础设施搭建**：`fputc` 重定向到 USART1 + Keil MicroLIB 勾选，启动时打印 Banner 展示 Flash 分区布局、三分支决策日志，后续调试不用示波器直接看串口即可。
+- **所有 D8 验证项通过**：编译 0 Error 0 Warning、APP无效慢闪、KEY0进IAP双闪、APP有效跳转D7正常运行、Bootloader烧APP/D7烧Bootloader互不覆盖。具备进入 D9（Ymodem协议理论 + 文件传输帧结构）的条件。
+
