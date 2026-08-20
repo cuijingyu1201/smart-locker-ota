@@ -27,7 +27,6 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
-#include "cmsis_os2.h"      /* CMSIS_V2 标准头文件，所有 osXXX API 都在这里 */
 #include "app_ipc.h"        /* 4 大 IPC 句柄：g_uart_mutex_handle / g_irq_sem_handle */
 #include "app_task.h"       /* 任务函数声明 */
 

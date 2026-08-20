@@ -81,7 +81,7 @@
           </BeforeMake>
           <AfterMake>
             <RunUserProg1>0</RunUserProg1>
-            <RunUserProg2>1</RunUserProg2>
+            <RunUserProg2>0</RunUserProg2>
             <UserProg1Name></UserProg1Name>
             <UserProg2Name></UserProg2Name>
             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
@@ -361,7 +361,7 @@
             </VariousControls>
           </Aads>
           <LDads>
-            <umfTarg>1</umfTarg>
+            <umfTarg>0</umfTarg>
             <Ropi>0</Ropi>
             <Rwpi>0</Rwpi>
             <noStLib>0</noStLib>
@@ -370,7 +370,7 @@
             <TextAddressRange></TextAddressRange>
             <DataAddressRange></DataAddressRange>
             <pXoBase></pXoBase>
-            <ScatterFile></ScatterFile>
+            <ScatterFile>07_mqtt_reconnect\07_mqtt_reconnect.sct</ScatterFile>
             <IncludeLibs></IncludeLibs>
             <IncludeLibsPath></IncludeLibsPath>
             <Misc></Misc>
@@ -457,6 +457,16 @@
               <FileName>mqtt_client.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Src\mqtt_client.c</FilePath>
+            </File>
+            <File>
+              <FileName>flash_param.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\flash_param.c</FilePath>
+            </File>
+            <File>
+              <FileName>flash_if.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\flash_if.c</FilePath>
             </File>
           </Files>
         </Group>

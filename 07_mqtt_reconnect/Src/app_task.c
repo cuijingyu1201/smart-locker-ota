@@ -6,13 +6,57 @@
 #include <stdio.h>
 #include "app_ipc.h"
 #include "app_uart.h"
+#include "flash_param.h"
+#include <string.h>
 
 uint32_t g_irq_cnt = 0;   /* 中断计数，TaskSemHandle 写，TaskPrint 读 */
+flash_param_t g_param_buf;/*参数区缓冲区，放 BSS 段，不用栈 */
 
 /* ======================== TaskLED ======================== */
 void TaskLED(void *argument)
 {
     (void)argument;
+
+    /* ===== APP 启动只做一次：参数区初始化 + boot_count++ ===== */
+    static uint8_t first_run = 1;
+    if (first_run) {
+        first_run = 0;
+        CRC32_InitTable();          /* 先初始化CRC32表，否则下面算出来全是0 */
+
+        int ret = FlashParam_Load(&g_param_buf);
+
+        if (ret != 0) {
+            printf("[PARAM] Uninitialized, loading defaults...\r\n");
+            memset(&g_param_buf, 0xFF, sizeof(g_param_buf));
+            g_param_buf.fw_ver_major  = 1;
+            g_param_buf.fw_ver_minor  = 0;
+            g_param_buf.fw_ver_patch  = 3;
+            g_param_buf.fw_build_num  = 1;
+            g_param_buf.boot_count    = 0;
+            g_param_buf.last_ota_result = 0;
+            memcpy(g_param_buf.device_id, "dev001", 6);
+            memcpy(g_param_buf.mqtt_topic_prefix, "iot/dev001", 10);
+        } else {
+            printf("[PARAM] Loaded: fw=%u.%u.%u build%u, boots=%u, prev_ota=%u\r\n",
+                   g_param_buf.fw_ver_major, g_param_buf.fw_ver_minor, g_param_buf.fw_ver_patch,
+                   g_param_buf.fw_build_num, g_param_buf.boot_count, g_param_buf.last_ota_result);
+        }
+
+        g_param_buf.boot_count++;
+        g_param_buf.last_reset_reason = RCC->CSR;
+
+        g_param_buf.fw_size_bytes = APP_FLASH_SIZE;          /* D9先用全区大小，D10改成真固件大小 */
+        g_param_buf.fw_crc32      = CRC32_CalcAppFlash();
+
+        if (FlashParam_Save(&g_param_buf) == 0) {
+            printf("[PARAM] Saved ok. boot_count = %u\r\n", g_param_buf.boot_count);
+            FlashParam_Print(&g_param_buf);
+        } else {
+            printf("[PARAM] Save FAIL!\r\n");
+        }
+    }
+
+    /* ===== 下面是原 TaskLED 心跳逻辑（完整保留）===== */
     led_msg_t msg;
     uint32_t delay_ms;
     for (;;)
@@ -120,7 +164,7 @@ void vApplicationIdleHook(void)
 void vApplicationMallocFailedHook(void)
 {
     printf("\r\n[ERROR] pvPortMalloc() FAILED! FreeRTOS Heap exhausted.\r\n");
-    printf("        -> 请在 CubeMX 中增大 TOTAL_HEAP_SIZE (当前 10240 Bytes)\r\n");
+    printf("          ！Please increase TOTAL_HEAP_SIZE in CubeMX (current 10240 Bytes)\r\n");
     for (;;) { osDelay(1000); }
 }
 
@@ -129,6 +173,6 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 {
     (void)xTask;
     printf("\r\n[ERROR] STACK OVERFLOW in task '%s' !\r\n", pcTaskName);
-    printf("        -> 请增大该任务的 STACK_SIZE 参数\r\n");
+    printf("        Please increase STACK_SIZE for this task\r\n");
     for (;;) { osDelay(1000); }
 }

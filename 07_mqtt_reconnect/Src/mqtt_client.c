@@ -330,6 +330,10 @@ int MQTT_ParsePublish(const uint8_t *data, int mqtt_len,
                       const char **topic_out, int *topic_len_out,
                       const uint8_t **payload_out, int *payload_len_out)
 {
+	
+    /* Ìí¼Óµ÷ÊÔ´òÓ¡ */
+    printf("[DEBUG] ParsePublish: len=%d, first_byte=0x%02X\r\n", mqtt_len, data[0]);
+		
     int remaining_len;
     int topic_len;
     int offset;
