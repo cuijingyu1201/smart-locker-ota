@@ -378,11 +378,10 @@ void TaskESP8266(void *argument)
             break;
         }
 
-               /* ---------------------------------------------------------------------
+        /* ---------------------------------------------------------------------
          * 状态 8：MQTT_WORKING → 5秒PUBLISH + 30秒PINGREQ + 检测掉线
          * --------------------------------------------------------------------- */
-        case ESP_STATE_MQTT_WORKING: {
-
+            case ESP_STATE_MQTT_WORKING: {
             /* ---- 第一件事：检查下行数据 / 掉线 / 下行PUBLISH（每 50ms）---- */
             if (g_esp_rx_sem_handle != NULL &&
                 osSemaphoreAcquire(g_esp_rx_sem_handle, 50) == osOK)
@@ -405,66 +404,62 @@ void TaskESP8266(void *argument)
                         break;
                     }
 
-                    /* (3) 解析下行 PUBLISH（Broker->板子）*/
+                    /* (3) D7新：解析下行 PUBLISH（Broker→板子）*/
                     {
                         const char    *topic = NULL;
                         int            topic_len = 0;
                         const uint8_t *payload = NULL;
                         int            payload_len = 0;
 
-                        /* Step1：找 +IPD, 前缀，跳过它定位到纯 MQTT 数据 */
+                       /* Step1：找 +IPD, 前缀，跳过它定位到纯 MQTT 数据 */
                         char *ipd_tag = strstr(line, "+IPD,");
                         if (ipd_tag != NULL) {
                             char *colon = strchr(ipd_tag + 5, ':');
                             if (colon != NULL) {
                                 int mqtt_start = (int)((colon + 1) - line);
                                 int mqtt_len   = rlen - mqtt_start;
-                                uint8_t *mqtt_data = (uint8_t *)&line[mqtt_start];
 
-                                /* D9：检查报文类型，只有 PUBLISH 才解析 */
-                                uint8_t pkt_type = mqtt_data[0] & 0xF0;
-                                printf("[MQTT] RX packet type=0x%02X, len=%d\r\n", pkt_type, mqtt_len);
+                                /* Step2：直接从 MQTT 数据开始解析 */
+                                int ret = MQTT_ParsePublish(
+                                    (uint8_t *)&line[mqtt_start],
+                                    mqtt_len,
+                                    &topic, &topic_len,
+                                    &payload, &payload_len);
+                                printf("[DEBUG] ParsePublish: ret=%d, topic_len=%d, payload_len=%d\r\n",
+                                       ret, topic_len, payload_len);
+                                if (ret == 0) {
+                                    printf("[MQTT] RX PUBLISH topic=%.*s payload=%.*s\r\n",
+                                           topic_len, topic, payload_len, payload);
 
-                                if (pkt_type == 0x30) {  /* 只有 PUBLISH 报文才解析 */
-                                    /* Step2：直接从 MQTT 数据开始解析 */
-                                    int ret = MQTT_ParsePublish(
-                                        mqtt_data, mqtt_len,
-                                        &topic, &topic_len,
-                                        &payload, &payload_len);
+                                    /* Step3：拷到局部buf加\0 */
+                                    if (payload != NULL && payload_len > 0) {
+                                        char json_buf[128];
+                                        int cp_len = (payload_len < (int)(sizeof(json_buf)-1))
+                                                     ? payload_len : (int)(sizeof(json_buf)-1);
+                                        memcpy(json_buf, payload, cp_len);
+                                        json_buf[cp_len] = '\0';
+                                        printf("[DEBUG] json_buf: [%s]\r\n", json_buf);
 
-                                    printf("[DEBUG] ParsePublish: ret=%d\r\n", ret);
-                                    if (ret == 0) {
-                                        printf("[MQTT] RX PUBLISH topic=%.*s payload=%.*s\r\n",
-                                               topic_len, topic, payload_len, payload);
-
-                                        /* Step3：拷到局部buf加\0 */
-                                        if (payload != NULL && payload_len > 0) {
-                                            char json_buf[128];
-                                            int cp_len = (payload_len < (int)(sizeof(json_buf)-1))
-                                                         ? payload_len : (int)(sizeof(json_buf)-1);
-                                            memcpy(json_buf, payload, cp_len);
-                                            json_buf[cp_len] = '\0';
-
-                                            /* Step4：匹配命令 */
-                                            if (strstr(json_buf, "\"cmd\":\"led_on\"") != NULL) {
-                                                HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);
-                                                printf("[MQTT] CMD: LED ON\r\n");
-                                            }
-                                            else if (strstr(json_buf, "\"cmd\":\"led_off\"") != NULL) {
-                                                HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
-                                                printf("[MQTT] CMD: LED OFF\r\n");
-                                            }
+                                        /* Step4：匹配命令 */
+                                        if (strstr(json_buf, "\"cmd\":\"led_on\"") != NULL) {
+                                            HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);
+                                            printf("[MQTT] CMD: LED ON\r\n");
                                         }
+                                        else if (strstr(json_buf, "\"cmd\":\"led_off\"") != NULL) {
+                                            HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
+                                            printf("[MQTT] CMD: LED OFF\r\n");
+                                        }
+                                        else if (strstr(json_buf, "\"cmd\":\"report\"") != NULL) {
+                                            last_send_tick = 0;
+                                            printf("[MQTT] CMD: Force report!\r\n");
+																				}
                                     }
-                                }
-                                else {
-                                    printf("[MQTT] Skip non-PUBLISH packet (type=0x%02X)\r\n", pkt_type);
                                 }
                             }
                         }
                     }
-                }
-            }
+								}
+						}
 
             /* ---- 第二件事：每 5 秒发一次温湿度 PUBLISH ---- */
             if ((now - last_send_tick) >= 5000) {
@@ -490,9 +485,9 @@ void TaskESP8266(void *argument)
                 printf("[MQTT] TX PINGREQ (%d bytes)\r\n", ping_len);
                 last_ping_tick = now;
             }
-
             break;
         }
+
         /* ---------------------------------------------------------------------
          * 状态 9：RECONNECT → 等 3 秒从头再来
          * --------------------------------------------------------------------- */

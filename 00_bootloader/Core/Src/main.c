@@ -26,7 +26,6 @@
 #include "flash_if.h"
 #include "jump_to_app.h"
 #include <stdio.h>
-#include "flash_param.h" 
 
 /* USER CODE END Includes */
 
@@ -59,8 +58,7 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/*参数区缓冲区，放 BSS 段，不用栈（flash_param_t 有 4096 字节，栈放不下）*/
-flash_param_t g_param_buf;
+
 /* USER CODE END 0 */
 
 /**
@@ -95,8 +93,6 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 	
-	CRC32_InitTable();    // 初始化 CRC32 表，否则 FlashParam_Load 会算出错误 CRC
-	
   /* ===== printf 重定向 ===== */
   /* （放在 fputc 里更规范，这里先简单实现）*/
 
@@ -112,41 +108,29 @@ int main(void)
 
   /* ===== 三分支状态机 ===== */
 
-  /* ====== 分支1：检查参数区里的 OTA 请求标志 ====== */
-{
-    int load_ok = FlashParam_Load(&g_param_buf);
+  /* ----- 分支 1：检查 OTA_FLAG（WiFi OTA 升级标志）----- */
+  uint32_t ota_flag = FLASH_ReadWord(OTA_FLAG_ADDR);
+  if (ota_flag == OTA_FLAG_MAGIC)
+  {
+      printf("[BOOT] OTA_FLAG detected! WiFi OTA mode (TODO D12)\r\n");
 
-    if (load_ok == 0 && g_param_buf.ota_request_magic == MAGIC_OTA_REQUEST)
-    {
-        /* 收到有效 OTA 请求：先清标志防止下次死循环，再进升级模式 */
-        printf("[BOOT] OTA_REQUEST (magic=0x%08X) detected! WiFi OTA mode (TODO D12)\r\n",
-               g_param_buf.ota_request_magic);
-        FlashParam_ClearOtaRequest();
+      /* 先清掉 FLAG，防止下次还进这里 */
+      FLASH_ErasePage(OTA_FLAG_ADDR);
 
-        printf("[BOOT] New FW expected: size=%u bytes, CRC=0x%08X\r\n",
-               g_param_buf.ota_new_fw_size, g_param_buf.ota_new_fw_crc32);
-
-        /* D12 才真的拉固件，D9/D10 暂时继续等 KEY0 进 IAP */
-        printf("[BOOT] Waiting for KEY0 to enter Serial IAP...\r\n");
-        while (1) {
-            if (HAL_GPIO_ReadPin(KEY0_GPIO_Port, KEY0_Pin) == GPIO_PIN_RESET) {
-                printf("[BOOT] KEY0 pressed! Serial IAP mode (TODO D10)\r\n");
-                while (1) {
-                    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
-                    HAL_Delay(200);
-                }
-            }
-            HAL_Delay(50);
-        }
-    }
-
-    /* 兼容 D8 写的旧 MAGIC_OLD_OTA_FLAG，防止用户之前写了旧标志卡住 */
-    else if (FLASH_ReadWord(OTA_FLAG_ADDR) == MAGIC_OLD_OTA_FLAG) {
-        printf("[BOOT] Legacy OTA_FLAG (0xA5A5A5A5) detected, clearing...\r\n");
-        FLASH_ErasePage(OTA_FLAG_ADDR);
-        /* 清完旧标志后，下面的分支继续正常判断（不强制进 OTA 模式） */
-    }
-}
+      /* D12 才实现 WiFi OTA，D8 先等 KEY0 进串口模式 */
+      printf("[BOOT] Waiting for KEY0 to enter Serial IAP...\r\n");
+      while (1)
+      {
+          if (HAL_GPIO_ReadPin(KEY0_GPIO_Port, KEY0_Pin) == GPIO_PIN_RESET) {
+              printf("[BOOT] KEY0 pressed! Serial IAP mode (TODO D10)\r\n");
+              while (1) {
+                  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+                  HAL_Delay(200);
+              }
+          }
+          HAL_Delay(50);
+      }
+  }
 
   /* ----- 分支 2：检查 KEY0 是否按住（串口 IAP 模式）----- */
   HAL_Delay(100);   /* 等 100ms 消抖 */
@@ -163,28 +147,17 @@ int main(void)
       }
   }
 
-  /* ----- 分支 3：APP 是否有效，有效则跳转 ----- */
+  /* ----- 分支 3：检查 APP 是否有效，有效就跳转 ----- */
   if (IsAppValid())
   {
       printf("[BOOT] APP valid, jumping to 0x%08X...\r\n", APP_FLASH_START);
-
-      /* 可选：打印参数区信息 */
-      {
-          if (FlashParam_Load(&g_param_buf) == 0) {
-              printf("[BOOT] Loaded param: fw=%u.%u.%u build=%u, boot_count=%u\r\n",
-                     g_param_buf.fw_ver_major, g_param_buf.fw_ver_minor, g_param_buf.fw_ver_patch,
-                     g_param_buf.fw_build_num, g_param_buf.boot_count);
-          } else {
-              printf("[BOOT] Param area uninitialized (will be set by APP)\r\n");
-          }
-      }
-
       HAL_Delay(200);
-      HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
-      JumpToApp();
+      HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);  /* 灭灯表示要走了 */
+      JumpToApp();   /* 跳转后不会返回 */
   }
   else
   {
+      /* APP 无效（没烧或写坏了），死等用户用串口救砖 */
       printf("[BOOT] APP NOT valid! Waiting for firmware...\r\n");
       printf("[BOOT] Hold KEY0 + Reset to flash via Serial IAP\r\n");
       while (1) {

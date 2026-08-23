@@ -2,10 +2,11 @@
 #define __FLASH_IF_H
 
 #include "main.h"
-#include "flash_partition.h"
 
 /* ==================== Flash 地址定义 ==================== */
 #define BL_FLASH_PAGE_SIZE      2048         /* F103ZE 每页 2KB */
+#define APP_FLASH_START      0x08008000   /* APP 起始地址 */
+#define APP_FLASH_SIZE       0x00074000   /* APP 大小 464KB */
 #define OTA_FLAG_ADDR        0x0807F000   /* OTA 标志区（最后一个扇区起始）*/
 #define OTA_FLAG_MAGIC       0xA5A5A5A5   /* OTA 升级标志值 */
 

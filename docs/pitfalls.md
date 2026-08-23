@@ -671,3 +671,336 @@ D8：Bootloader 基础框架开发 + Flash 三分支状态机（2026-08-19）
 - **Bootloader printf 基础设施搭建**：`fputc` 重定向到 USART1 + Keil MicroLIB 勾选，启动时打印 Banner 展示 Flash 分区布局、三分支决策日志，后续调试不用示波器直接看串口即可。
 - **所有 D8 验证项通过**：编译 0 Error 0 Warning、APP无效慢闪、KEY0进IAP双闪、APP有效跳转D7正常运行、Bootloader烧APP/D7烧Bootloader互不覆盖。具备进入 D9（Ymodem协议理论 + 文件传输帧结构）的条件。
 
+
+
+D9：参数区(flash_param_t) + CRC32校验 + Bootloader/APP共享读写（2026-08-20）
+阶段归属：阶段3 OTA系统架构 · 参数区层
+
+---
+
+## 坑1：_Static_assert 在 ARMCC V5 不支持（编译错误 #79/#260-D）
+
+- **现象**：`flash_partition.h(88): error: #79: expected a type specifier` + `#260-D: explicit type is missing ("int" assumed)`，报错指向 `_Static_assert(sizeof(flash_param_t) == 4096, ...)` 这行，Bootloader 和 APP 两个工程都编译失败。
+- **根因**：`_Static_assert` 是 **C11** 标准引入的关键字。Keil ARMCC V5.06（V5 编译器）默认用 C99 标准，不认识 `_Static_assert`，把它当成普通标识符解析 → 语法错误。ARMCC V6（Clang based）才默认支持 C11。
+- **排查过程**：
+  1. 报错行就是 `_Static_assert(...)` → 直接锁定。
+  2. 查 Keil 编译器版本：`V5.06 update 7 (build 960)` → 确认是 ARMCC V5。
+  3. 查 _Static_assert 标准归属：C11 → V5 默认不支持。
+- **解决**：用 C99 兼容的静态断言宏（typedef 一个数组，条件不满足时数组大小为负，编译器报错）：
+  ```c
+  #define STATIC_ASSERT_CONCAT_(a, b) a##b
+  #define STATIC_ASSERT_CONCAT(a, b) STATIC_ASSERT_CONCAT_(a, b)
+  #define STATIC_ASSERT(cond, msg) \
+      typedef char STATIC_ASSERT_CONCAT(static_assert_, __LINE__)[(cond) ? 1 : -1]
+
+  STATIC_ASSERT(sizeof(flash_param_t) == 4096, param_size_must_be_4096);
+  ```
+  条件成立时 typedef `char arr[1]`（合法），条件不成立时 typedef `char arr[-1]`（负数组大小，编译报错）。
+- **教训**：跨编译器写代码时，C11/C99 特性要先确认编译器支持。ARMCC V5 默认 C99，V6 默认 C11/C17。用 `_Static_assert`、`_Alignas`、匿名结构体成员等 C11 特性前，要么切 V6，要么写 C99 兼容版本。静态断言用 typedef 数组负大小的技巧是嵌入式最通用的写法，V5/V6/gcc 都认。
+
+## 坑2：CRC32 查表法静态表手动输入列数错误（#146 too many initializer values）
+
+- **现象**：`flash_param.c(43): error: #146: too many initializer values`，指向 CRC32 静态查表的初始化。
+- **根因**：最初用"静态写死 256 项 CRC32 表"的方式（`static uint32_t crc32_table[256] = {0x00000000, 0x77073096, ...}`）。256 项太多，手动输入时某一行多打了一个逗号或少打了一个值，编译器认为初始化值个数 > 数组大小 → #146。
+- **排查过程**：
+  1. 报错行就是表初始化 → 锁定。
+  2. 数 256 项的个数 → 数到眼花也数不准到底是 255 还是 256 项。
+  3. 意识到"手动输入 256 项永远会错"→ 改方案。
+- **解决**：废弃静态表，改成**运行时生成**（多项式 0xEDB88320，上电调一次 `CRC32_InitTable()` 填表，占 1KB RAM，生成耗时约 50 微秒）：
+  ```c
+  static uint32_t crc32_table[256];
+  void CRC32_InitTable(void) {
+      for (uint32_t i = 0; i < 256; i++) {
+          uint32_t crc = i;
+          for (uint32_t bit = 0; bit < 8; bit++) {
+              crc = (crc & 1u) ? ((crc >> 1) ^ CRC32_POLYNOMIAL) : (crc >> 1);
+          }
+          crc32_table[i] = crc;
+      }
+  }
+  ```
+- **教训**：查表法查表可以静态写死，但**超过 32 项的表就别手输了**，列数/项数迟早数错。运行时生成更可靠：代码只有两层 for 循环，复制即正确，代价是 1KB RAM + 50μs 启动时间，对 STM32F103 完全可接受。
+
+## 坑3：flash_param_t (4096字节) 放栈上导致栈溢出卡死
+
+- **现象**：`FlashParam_Save` 函数里声明 `flash_param_t buf;`（4096 字节局部变量），调用后系统直接卡死，串口无任何输出，LED 停闪。
+- **根因**：`flash_param_t` 强制大小 4096 字节（`_Static_assert` 校验）。`FlashParam_Save` 是被 `TaskAppParam`（栈 512 words = 2048 字节）调用的，光这一个局部变量就吃掉 4096 字节，是栈的 2 倍 → 栈底 canary 被踩 → HardFault 或调度器状态机崩溃。
+- **排查过程**：
+  1. 调用 `FlashParam_Save` 后立刻卡死，不调用就正常 → 锁定该函数。
+  2. 读代码发现 `flash_param_t buf;` 在栈上 → 4096 字节 > 任务栈 2048 字节 → 必爆。
+  3. 用 `uxTaskGetStackHighWaterMark` 确认剩余栈为 0。
+- **解决**：把局部变量改成**全局静态变量** `g_param_buf_internal`，放 BSS 段（不占栈）：
+  ```c
+  static flash_param_t g_param_buf_internal;  /* 放 BSS 段，避免栈溢出 */
+  int FlashParam_Save(const flash_param_t *p_in) {
+      memcpy(&g_param_buf_internal, p_in, sizeof(flash_param_t));
+      /* 后续操作都用 g_param_buf_internal */
+  }
+  ```
+- **教训**：嵌入式的铁律——**单任务栈不能放超过栈大小 1/4 的局部变量**。512 words(2048B) 的任务，单个局部变量上限 512 字节。`flash_param_t` 这种 4KB 结构体必须放全局静态或堆。判别标准：局部变量 > 256 字节就要警惕，> 512 字节基本必须改全局/静态。
+
+## 坑4：__disable_irq() 关中断导致 HAL 时间基失效 → HAL_FLASH_Program 超时判断崩
+
+- **现象**：`[PARAM] Erase OK` 但 `[PARAM] Write FAIL!`，写入一直失败。参考链接的 AI 建议加 `__disable_irq()` 防止"中断打断 Flash 写入"，加了之后反而更糟。
+- **根因**：这是参考链接 AI 建议**搞反因果**的典型。STM32F103 写 Flash 时 CPU 硬件会自动 stall（同一 Bank 取指/取数等写完），根本不需要软件关中断保护。而 `__disable_irq()` 的真正危害是：
+  1. 项目 HAL 时间基是 **TIM4 中断**（不是 SysTick，被 FreeRTOS 占了）。
+  2. `__disable_irq()` 关全局中断 → TIM4 中断进不来 → `uwTick` 冻结。
+  3. `HAL_FLASH_Program` 内部调 `FLASH_WaitForLastOperation`，用 `HAL_GetTick()` 做超时判断（`while(... && (HAL_GetTick() - tickstart) < Timeout)`）。
+  4. `uwTick` 冻结 → `HAL_GetTick()` 返回值不变 → 超时判断失效 → 返回 HAL_TIMEOUT → 你看到 Write FAIL。
+  也就是说，参考链接让你加的 `__disable_irq()` **本身就是 Write FAIL 的制造者**。
+- **排查过程**：
+  1. 参考链接（AI 生成，顶部标注"may not be fully accurate"）建议加关中断 → 加了还是 FAIL。
+  2. 加诊断打印 `HAL_FLASH_Program` 返回的 `status` 值 → 是 `0x01`（HAL_ERROR），不是 timeout（HAL_TIMEOUT=3）。
+  3. 但关中断的危害是让 `HAL_GetTick` 失效，这会间接导致 `FLASH_WaitForLastOperation` 误判。
+  4. 读 `flash_if.c` 确认 `__disable_irq()` / `__enable_irq()` 还在 → 移除。
+- **解决**：移除 `FLASH_WriteBuf` 里的 `__disable_irq()` 和 `__enable_irq()`。STM32F103 写 Flash 硬件自动 stall CPU，不需要软件关中断；时间基依赖 TIM4 中断，关中断必然冻 `uwTick`。
+- **教训**：AI 生成的修改建议（尤其带"可能不准确的"标注的）要带着怀疑看。判断"关中断"是否必要的关键是：① 写 Flash 这种操作硬件本身是否需要原子性保护（STM32F1 不需要，硬件 stall）；② 关中断会不会影响 HAL 时间基（项目用 TIM4 当时间基，关中断必冻 `uwTick`）。两个条件叠加，`__disable_irq()` 在这个项目里永远是错的。
+
+## 坑5：FLASH_ErasePage 的 NbPages=1 只擦 2KB，参数区 4KB 跨 2 页 → 第二次启动卡死（最致命）
+
+- **现象**：
+  - 第一次上电（全新芯片）：`Write OK`，参数区能写，系统正常跑。
+  - 按一次 Reset（第二次启动）：Bootloader 读到 `boot_count=1`，APP 调 `FlashParam_Save` 重新写参数区，写到一半串口卡在 `[FLA`（打印 `[FLASH]` 开头就死），再怎么 Reset 也没用，板子彻底卡死。
+- **根因**：STM32F103**ZE**T6 每页 = **2KB**（HAL 库 `FLASH_PAGE_SIZE = 2048`），不是 4KB。参数区定义是 4KB（`PARAM_FLASH_SIZE = 0x1000`），**跨了 2 页**：
+  - 第 1 页：0x0807F000–0x0807F7FF（结构体前 2KB，i=0~511）
+  - 第 2 页：0x0807F800–0x0807FFFF（结构体后 2KB 含 tail_marker，i=512~1023）
+  而 `FLASH_ErasePage` 里 `erase_init.NbPages = 1`，**只擦第 1 页，第 2 页从来没被擦过**。这导致两次启动行为不同：
+  | 启动 | 第 2 页状态 | 写入结果 |
+  |---|---|---|
+  | 第 1 次 | 出厂全新 0xFF | 1024 word 全写成功 → `Write OK`（假象） |
+  | 第 2 次 | 有第 1 次的旧数据 ≠0xFF | i=512 @0x0807F800 触发 PGERR → 打印 `[FLA` 到一半 HardFault → 卡死 |
+  `flash_partition.h` 里注释 `/* 4KB = 1 page @ F103ZE */` 是**错的**，F103ZE 每页 2KB，4KB 是 2 页。
+- **排查过程**：
+  1. 第一次 `Write OK` 但第二次卡死 → 怀疑擦除不充分（第 2 页没擦干净）。
+  2. 加诊断打印 `status` 值 → 第一次 `status=0x01`（HAL_ERROR，PGERR/WRPRTERR），失败位置 `i=1020 @0x0807FFF0` 正是 `tail_marker`，在第 2 页。
+  3. 查 STM32F103ZET6 页大小 → HAL 库 `FLASH_PAGE_SIZE=2048`，每页 2KB。
+  4. 算参数区页数：4KB / 2KB = 2 页，`NbPages=1` 只擦一半。
+  5. 确认第 2 页（0x0807F800–0x0807FFFF，含 tail_marker）从来没被擦。
+- **解决**：`FLASH_ErasePage` 里 `NbPages` 从 `1` 改成 `2`：
+  ```c
+  erase_init.NbPages = 2;   /* 参数区 4KB = 2 页 @ F103ZE(每页2KB) */
+  ```
+  并把 `flash_partition.h` 的误导注释改成 `/* 4KB = 2 pages @ F103ZE (每页 2KB) */`。改完第一次 `Write OK`，**按 Reset 第二次不再卡**，`boot_count` 能从 3 累加到 4，跨复位持久化全通。
+- **教训**：STM32F1 系列页大小按容量分档——中小容量（≤128KB Flash）每页 1KB，大容量（≥256KB，如 ZET6）每页 2KB。写 Flash 擦除函数时，`NbPages` 必须按"参数区大小 / 实际页大小"算，不能想当然写 1。`flash_partition.h` 里这种"4KB=1 page"的注释是埋雷，必须和实际页大小对齐。这类 bug 的特征是"第一次能过、第二次必死"，遇到就优先查擦除范围。
+
+## D9 成果
+
+- **参数区架构落地**：`flash_param_t` 结构体（4096 字节，强制 4 字节对齐 + packed），涵盖固件版本（major/minor/patch/build）、OTA 请求控制（magic/new_crc/new_size/rollback）、运行状态（boot_count/reset_reason/ota_result）、设备信息（device_id/mqtt_prefix）、Tail 冗余校验（tail_marker/tail_crc）。`flash_partition.h` 统一管理三分区地址宏，Bootloader 和 APP 两边 include 同一份，改分区只改一个文件。
+- **CRC32 查表法实现**：IEEE 802.3 多项式 0xEDB88320，运行时生成 256 项查表（`CRC32_InitTable` 上电调一次），`CRC32_Calc` 计算任意内存块 CRC，`CRC32_CalcAppFlash` 计算整片 APP 区 CRC（D12 OTA 校验用）。
+- **参数区三重校验读写 API**：
+  - `FlashParam_Load`：Flash→RAM，校验 magic_header + tail_marker + struct_crc32，任一不过返回 -1（参数区未初始化或损坏）。
+  - `FlashParam_Save`：RAM→Flash（自动擦 2 页 + 写 4096 字节），内部填 magic/tail/CRC，写完可被下次 Load 校验通过。
+  - `FlashParam_SetOtaRequest` / `FlashParam_ClearOtaRequest`：D12 OTA 请求位写入，Bootloader 读到 `ota_request_magic=0x4F544131` 触发升级流程。
+- **Bootloader / APP 共享读写闭环验证通过**：
+  - APP 端写参数区（`FlashParam_Save`）→ Flash 持久化。
+  - Bootloader 端读参数区（`FlashParam_Load`）→ 打印 `fw=1.0.3 build=1 boot_count=N`。
+  - APP 端读参数区 → `boot_count` 跨复位累加（3→4→5...）。
+  - magic_header=0x504D5431 / tail_marker=0xDEADBEEF / struct_crc32 三重校验全过。
+- **D9 所有踩坑修复**：`_Static_assert`→C99 兼容宏；CRC32 表→运行时生成；栈溢出→全局静态变量；`__disable_irq()`→移除；`NbPages=1`→`NbPages=2`。
+- **编译 0 Error 0 Warning**，Bootloader + APP 双工程均干净通过。
+- 具备进入 D10（Ymodem 串口 IAP 烧录）的条件：参数区已能保存 OTA 请求标志，Bootloader 三分支状态机已预留 OTA_FLAG 分支，Flash 操作函数已封装好。
+
+
+
+
+D10：Ymodem 串口 IAP 救砖通道（Bootloader 端 Ymodem 接收 + IAP 写 Flash + CRC32 双重校验）（2026-08-23）
+阶段归属：阶段4 串口救砖通道 · IAP/Ymodem 层
+
+---
+
+## 坑1：iap.c 重复定义 CRC32 静态查表 → #146 too many initializer values
+
+- **现象**：Rebuild Bootloader 工程报 `iap.c(87): error: #146: too many initializer values`，指向 `static const uint32_t tbl[256] = {0x00000000, 0x77073096, ...}` 这一行。同时 4 个文件报 `#1-D: last line of file ends without a newline` warning。
+- **根因**：D9 阶段已经踩过同样的坑（D9 坑2），结论是"超过 32 项的静态表不要手输"。但 D10 写 `iap.c` 时为了让 IAP 层独立计算流式 CRC32，又把 256 项 CRC32 表手输了一遍——256 项的列数/项数只要错一个逗号或漏一项就触发 #146。同一个错误犯两次，是因为没有把 D9 的"运行时生成表"方案对外暴露为公共 API，导致每个用到 CRC32 的新模块都要自带一份表。
+- **排查过程**：
+  1. 编译日志直接点出 `iap.c(87)` 是 `static const uint32_t tbl[256] = {...}` 这行。
+  2. 看到 256 项静态表 + #146 → 立刻想起 D9 坑2 的结论。
+  3. 翻 `flash_param.c`，发现它已经有运行时生成的 `crc32_table[256]`，但是是 `static` 的，外部文件 `iap.c` 访问不到 → 只能自己再抄一份。
+- **解决**：把 D9 的运行时表通过三个流式接口暴露出来，`iap.c` 删掉自己的静态表，统一调公共 API：
+  ```c
+  /* flash_param.h 新增 3 个流式接口 */
+  void     CRC32_StreamReset(uint32_t *ctx);                              /* ctx = 0xFFFFFFFF */
+  void     CRC32_StreamUpdate(uint32_t *ctx, const uint8_t *data, uint32_t len);  /* 流式累加 */
+  uint32_t CRC32_StreamFinalize(uint32_t *ctx);                          /* XOR 0xFFFFFFFF 取反 */
+
+  /* flash_param.c 新增 3 个实现，复用本文件已有的 static crc32_table */
+  void CRC32_StreamReset(uint32_t *ctx) { if (ctx) *ctx = 0xFFFFFFFFUL; }
+  void CRC32_StreamUpdate(uint32_t *ctx, const uint8_t *data, uint32_t len) {
+      if (!ctx || !data) return;
+      uint32_t crc = *ctx;
+      for (uint32_t i = 0; i < len; i++) {
+          crc = (crc >> 8) ^ crc32_table[(crc ^ data[i]) & 0xFF];
+      }
+      *ctx = crc;
+  }
+  uint32_t CRC32_StreamFinalize(uint32_t *ctx) {
+      return (*ctx) ^ 0xFFFFFFFFUL;
+  }
+  ```
+  `iap.c` 里调用方式变成：
+  ```c
+  uint32_t g_running_crc;
+  CRC32_StreamReset(&g_running_crc);
+  CRC32_StreamUpdate(&g_running_crc, data, len);   /* 每收到一包累加 */
+  uint32_t crc_ram   = CRC32_StreamFinalize(&g_running_crc);
+  uint32_t crc_flash = CRC32_Calc((const uint8_t *)APP_FLASH_START, total_size);
+  ```
+- **教训**：查表法的表本身不应该是"每个模块各抄一份"的资源。一个项目里只要有一份运行时生成的 CRC32 表就够了，但必须通过公共 API 暴露出去，否则后来者要么再抄一份表（必然踩 #146），要么直接访问别人文件里的 `static` 变量（编译报错）。**CRC32 这种公共算法应该一开始就设计成 Reset/Update/Finalize 三段式流式接口**，因为 IAP/OTA 这种场景必然需要"边收边算"，一次性 `CRC32_Calc(buf, len)` 接口在 464KB 固件 + 64KB SRAM 的场景下根本放不下整包缓冲区。
+
+## 坑2：HAL_UART_Receive 阻塞接收导致 ORE 帧错位 → 文件头过了但数据帧永远失败
+
+- **现象**：用 Tera Term 发 `app.bin`，日志显示 `header_ok=1`（文件头解析成功，`header_size=30268`），但进入数据阶段后立刻报 `Invalid frame start: 0x81`，然后 `Frame-start timeout` / `Ymodem FAIL! code=-2 (size=0 bytes)`。反复重试，数据帧阶段永远过不了，但文件头每次都能过。
+- **根因**：最初的 `y_recv_frame()` 用 `HAL_UART_Receive(&huart1, &header, 1, timeout)` 逐字节/逐字段阻塞接收。看起来是"持续监听"，实际只有代码执行到 `HAL_UART_Receive()` 这一行时才主动等字节。Ymodem 协议的关键时序是：
+  1. 接收端发 `ACK` + `C` 给发送端；
+  2. 发送端收到 `C` 后**立即**开始发下一帧（SOH/STX + seq + ~seq + 1024B + CRC16）；
+  3. 接收端在发完 `C` 之后，还忙着 `printf` 打调试信息、切换接收阶段状态、写 Flash；
+  4. 发送端的下一帧字节已经到 USART1，但 CPU 没在调 `HAL_UART_Receive`，RXNE 没及时清 → ORE（Overrun）→ 帧头字节丢失 → 后续 payload 中某个字节被误认成"帧头"（比如 0x81）→ 整帧错位。
+  文件头能过是因为文件头只有 128 字节 + 发送端发完头帧后会等 ACK，时间窗口宽；数据帧是 1024 字节连发，时间窗口窄，必丢。
+- **排查过程**：
+  1. 看到 `header_ok=1` 但数据帧报 `Invalid frame start: 0x81` → 0x81 不是 SOH(0x01)/STX(0x02)/EOT(0x04)/CAN(0x18) → 说明解析器从错误字节边界开始解释数据。
+  2. 0x81 这种值正好是 payload 里的普通字节 → 锁定"帧头错位"而不是 CRC 算法错。
+  3. 检查 `huart1.ErrorCode` 发现 ORE 位置过 → 接收溢出。
+  4. 对比时序：发完 `C` 后 `printf` 调试文本 + 切阶段，这段时间 CPU 不在 `HAL_UART_Receive` → 发送端的下一帧被错过。
+- **解决**：改成 **USART1 RX 中断 + 4KB 环形缓冲区**，把"接收字节"和"解析帧"解耦：
+  ```c
+  #define Y_RX_RING_SIZE 4096U
+  #define Y_RX_RING_MASK (Y_RX_RING_SIZE - 1U)
+  static volatile uint8_t  y_rx_ring[Y_RX_RING_SIZE];
+  static volatile uint16_t y_rx_head;
+  static volatile uint16_t y_rx_tail;
+
+  /* USART1 RX 中断：只做 3 件事，不能阻塞 */
+  void Ymodem_UART_IRQHandler(void) {
+      uint32_t sr = huart1.Instance->SR;
+      if ((sr & USART_SR_RXNE) != 0U) {
+          uint8_t byte = (uint8_t)(huart1.Instance->DR & 0xFFU);
+          uint16_t next = (y_rx_head + 1U) & Y_RX_RING_MASK;
+          if (next == y_rx_tail) {
+              y_rx_overrun = 1U;                      /* 环满，标记 overrun */
+          } else {
+              y_rx_ring[y_rx_head] = byte;
+              y_rx_head = next;
+          }
+      }
+  }
+  ```
+  主循环里的 `y_recv_byte()` 从 `ring[tail]` 取字节 + 超时判断。中断负责把每个字节搬进 ring，CPU 即使在 `printf`/写 Flash/发 ACK，RX 中断仍然持续收字节，发送端的下一帧不会因为主循环暂时没调接收函数而丢失。
+- **教训**：Ymodem 这类"发送端不等接收端准备好就连续发包"的协议，**不能用阻塞轮询接收**。阻塞接收的隐藏前提是"CPU 全程只在等字节"，一旦 CPU 要做别的（打印/写 Flash/发控制字节），RXNE 就会漏。中断 + 环形缓冲区是嵌入式串口协议的标准答案：中断快（只搬字节，不调用任何阻塞 API），ring 吸收速度差，解析器按协议字段慢慢取。环形缓冲区大小要 ≥ 2 倍最大单帧（STX 帧 1024B，ring 给 4KB 绰绰有余）。中断里绝对不能 `printf`、不能写 Flash、不能等超时——否则又把"中断必须快"的优势破坏了。
+
+## 坑3：擦 APP Flash 放在 Ymodem 回调里 → 握手期间 PC 发的首包被冲垮
+
+- **现象**：把 `FLASH_EraseAppArea()`（擦 464KB = 232 页，耗时约 2 秒）写在 `iap_on_packet()` 回调里（即"收到第一包数据时再擦 Flash"）。结果 `header_ok=1` 后，Bootloader 边擦 Flash 边等 Ymodem 数据帧，2 秒擦除期间 PC 发来的数据帧全部堆在环形缓冲区里，擦完后解析器从头取字节时已经错位，报 `Frame-start timeout` 或 `Invalid frame start`。即使加大 ring 也救不回来——232 页擦除期间 PC 早就发了好几帧。
+- **根因**：把擦 Flash 放回调里的初衷是"懒加载"——以为"等收到第一包再擦，省得空跑"。但 Ymodem 的时序不允许：
+  1. Bootloader 发 `C` 握手；
+  2. PC 收到 `C` 发文件头（block-0）；
+  3. Bootloader 回 `ACK` + `C`；
+  4. PC **立刻**开始发第一帧数据帧（不等 Bootloader 干别的）；
+  5. 如果此时 Bootloader 在回调里开始擦 2 秒 Flash，PC 的数据帧持续灌进来 → ring 被填满 → 后续帧 overrun 丢字节 → 解析错位。
+  擦 Flash 这种"长耗时阻塞操作"必须和"协议时序敏感的接收窗口"完全错开。
+- **排查过程**：
+  1. 现象是"文件头过了，但数据帧阶段 timeout/错位" → 起初怀疑是坑2的接收问题。
+  2. 但坑2已经修了中断+ring，还是失败 → 排查时序。
+  3. 在 `iap_on_packet` 里加 `printf` 时间戳，发现"收到第一包"到"擦完 Flash"之间隔了 2 秒，这 2 秒 PC 没停过发包。
+  4. 把擦 Flash 移到 `IAP_ProcessSerial()` 入口（握手发 `C` 之前），问题消失。
+- **解决**：把擦 APP Flash 从回调移到 IAP 入口，**先擦完再发 `C` 握手**：
+  ```c
+  int IAP_ProcessSerial(void) {
+      /* 1. 先擦 APP Flash（2 秒），擦完 PC 还没开始发数据 */
+      printf("[IAP] Pre-erasing APP flash (0x%08X, %u bytes, 232 pages)...\r\n",
+             APP_FLASH_START, APP_FLASH_SIZE);
+      if (FLASH_EraseAppArea() != HAL_OK) {
+          printf("[IAP] !!! Pre-erase FAIL, abort IAP.\r\n");
+          return -1;
+      }
+      printf("[IAP] Pre-erase OK. Now sending 'C' for Ymodem handshake...\r\n");
+
+      /* 2. 擦完才发 'C'，PC 收到 'C' 才开始发头帧，时序不冲突 */
+      ret = Ymodem_Receive(NULL, APP_FLASH_SIZE, &g_total_size, iap_on_packet);
+  }
+  ```
+  回调 `iap_on_packet()` 只负责"写 Flash + 累加 CRC32"，不再做擦除。擦除在握手之前完成，PC 在 Bootloader 擦 Flash 期间根本不会发包（还没收到 `C`），时序完全错开。
+- **教训**：Ymodem/IAP 这种"协议时序敏感 + 长耗时 Flash 操作"并存的设计，**长耗时操作必须放在协议握手之前**，不能放在回调里。回调是"每收到一包触发一次"的高频路径，里面放 2 秒擦除等于每包都卡 2 秒——但 Ymodem 发送端不会等，会持续灌包。判断标准：凡是耗时 > 100ms 的操作（擦 Flash、擦参数区、写大块数据），都不能放在 Ymodem 帧回调里，必须前置到握手前或后置到全部接收完后。回调里只做"写当前包到 Flash + 累加 CRC"这种微秒级操作。
+
+## 坑4：EOT 分支不更新 received_size → IAP 层 size=0 误导排错
+
+- **现象**：日志显示 `frame_ret=-1` `hdr=0x04`（0x04 就是 EOT，`frame_ret=-1` 是 `y_recv_frame()` 用来表示收到 EOT 的内部返回值），`header_ok=1` `header_size=30268`，但最终打印 `[IAP] Ymodem FAIL! code=-2 (size=0 bytes)`。看起来"数据一包都没收到"，但 Flash 里其实已经写入了大部分甚至全部 APP。
+- **根因**：`Ymodem_Receive()` 在收到 EOT 时，旧代码直接 `break` 跳出数据循环，没有先执行 `*received_size = total_received;`。`received_size` 是出参指针，指向 IAP 层的 `g_total_size`。EOT 分支不更新它，`g_total_size` 就一直是初始化值 0。IAP 层拿到 `size=0` → 以为没收到数据 → 报 `Y_ERR_CRC` → 误导排错方向（去查 CRC 算法，其实 CRC 根本没机会算）。
+  这不是"真的没收到数据"，而是"出参没写回去"的统计错误。
+- **排查过程**：
+  1. 看到 `size=0` 起初以为"一包都没收到" → 但 `hdr=0x04` 说明已经走到 EOT，EOT 是发送端发完所有数据帧后才发的 → 矛盾。
+  2. 看 `header_ok=1` `header_size=30268` → 文件头过了，大小也解析对了 → 数据帧阶段肯定收过包。
+  3. 检查 `flash_written` 计数器 → 发现已经写了几万字节 → 实际收到了数据。
+  4. 锁定问题在"出参没更新"：`y_recv_frame()` 返回 -1（EOT）的分支直接 break，没写 `*received_size`。
+- **解决**：在 EOT 分支 `break` 之前，确保 `total_received` 赋值给 `received_size`，在所有可能的退出路径上都正确更新出参：
+  ```c
+  if (ret == -1) {                 /* y_recv_frame() 收到 EOT */
+      y_send_byte(errors == 0 ? Y_NAK : Y_ACK);   /* 兼容单/双 EOT */
+      /* ... 兼容第二个 EOT、单 EOT、额外控制字节 ... */
+      break;
+  }
+  /* 跳出数据循环后，统一更新出参（所有退出路径都走这里）*/
+  if (received_size != NULL) {
+      *received_size = total_received;
+  }
+  ```
+  把"更新出参"从 EOT 分支内部移到循环外统一处理，这样无论是 EOT 退出、CRC 错误退出、超时退出，`received_size` 都能拿到真实值。
+  同时补一个硬校验：EOT 不代表文件完整，EOT 后必须比 `total_received != file_total_size` → `return Y_ERR_SIZE`。
+- **教训**：Ymodem 这类"多阶段 + 多退出路径"的协议函数，**出参必须在所有退出路径上统一更新**，不能只在某个分支里写。最稳妥的写法是"循环内只 break/continue，循环外统一写出参"。排查这类"size=0 但实际有数据"的日志时，**不能只看 `size` 字段，要交叉看 `hdr`（0x04=EOT）、`header_ok`、`header_size`、`flash_written`**——如果 `hdr=0x04` 且 `flash_written` 已经增长，那"size=0"必然是统计错误而不是真的没收到。
+
+## 坑5：APP 启动后无条件覆盖 IAP 保存的 fw_size_bytes 和 fw_crc32
+
+- **现象**：D10 串口 IAP 成功后，参数区保存了正确的 `fw_size=30268` `fw_crc32=0x59B4EA2B`（IAP 流式 CRC + Flash 回读 CRC 双重一致）。但 APP 跑起来后，下次 Bootloader 读参数区，`fw_size` 变成了 475136（整个 APP 分区大小），`fw_crc32` 变成了全区 CRC——IAP 保存的"真实固件大小/CRC"被覆盖，OTA 校验语义被破坏。
+- **根因**：`app/Src/app_task.c` 的参数初始化逻辑是：
+  ```c
+  int ret = FlashParam_Load(&g_param_buf);
+  if (ret == 0) {
+      /* 参数区有效 */
+  } else {
+      /* 参数区无效，建默认值 */
+  }
+  /* ← 无条件执行这两行，不管参数区有没有效 ← */
+  g_param_buf.fw_size_bytes = APP_FLASH_SIZE;       /* 475136 */
+  g_param_buf.fw_crc32      = CRC32_CalcAppFlash(); /* 全区 CRC */
+  ```
+  这两行写在 if/else 外面，导致**无论参数区是否有效**，APP 启动后都把 `fw_size/fw_crc` 覆盖成"整片 APP 分区的值"。IAP 精心保存的"30268 字节真实固件 + 0x59B4EA2B"被冲掉。这不会改变 Flash 里的 APP 内容（APP 还能跑），但破坏了参数区"真实固件大小/CRC"的语义——D12 WiFi OTA 校验时本应比 `fw_size=30268`，现在变成比 475136，必然 mismatch。
+- **排查过程**：
+  1. D10 成功日志里 `Param Save OK. build=2, fw_crc=0x59B4EA2B, fw_size=30268B` → IAP 写参数正确。
+  2. 但 APP 跑起来后，下次 Bootloader 读出来 `fw_size` 变了 → 怀疑 APP 覆盖。
+  3. 读 `app_task.c`，发现 `fw_size_bytes = APP_FLASH_SIZE` 这两行在 `FlashParam_Load` 的 if/else 外面 → 无条件执行。
+  4. 参数区有效（IAP 刚写过）时，APP 不应该再覆盖，应该直接用 IAP 保存的值。
+- **解决**：把 `fw_size_bytes` 和 `fw_crc32` 的赋值移到"参数区无效"的 `else` 分支里，只在需要建默认值时才赋：
+  ```c
+  int ret = FlashParam_Load(&g_param_buf);
+  if (ret == 0) {
+      /* 参数区有效，IAP 保存的 fw_size_bytes=30268 / fw_crc32=0x59B4EA2B 是真实值
+       * APP 不应该覆盖，直接用 */
+  } else {
+      /* 参数区无效，建默认值 */
+      g_param_buf.fw_ver_major  = 1;
+      g_param_buf.fw_ver_minor  = 0;
+      g_param_buf.fw_ver_patch  = 0;
+      g_param_buf.fw_build_num  = 1;
+      g_param_buf.boot_count    = 0;
+      g_param_buf.fw_size_bytes = APP_FLASH_SIZE;        /* ← 只在无效时才用整片默认值 */
+      g_param_buf.fw_crc32      = CRC32_CalcAppFlash();  /* ← 同上 */
+      strncpy(g_param_buf.device_id, "dev001", ...);
+      FlashParam_Save(&g_param_buf);
+  }
+  ```
+  参数区有效时 APP 只读不写，IAP 保存的真实 `fw_size/fw_crc` 被保留，D12 OTA 校验语义正确。
+- **教训**：Bootloader 和 APP 共享参数区时，**APP 端的"参数初始化"必须区分"首次创建默认值"和"读取已有值"两条路径**，不能无条件覆盖。判别标准：`FlashParam_Load` 返回 0（有效）→ 只读不改；返回 -1（无效/未初始化）→ 才建默认值并 Save。凡是涉及"固件大小/CRC/版本/boot_count"这种被多方写入的字段，APP 端默认初始化时一定要包在 `else` 里，否则会把 Bootloader/IAP 精心保存的状态冲掉。这类 bug 的特征是"IAP/OTA 刚写完是对的，APP 跑一次就变了"——遇到就优先查 APP 的参数初始化是不是无条件覆盖。
+
+## D10 成果
+
+- **Ymodem 串口 IAP 救砖通道落地**：Bootloader 端实现完整 Ymodem-CRC 接收器（`ymodem.c`/`ymodem.h`），支持 SOH(128B)/STX(1024B) 双帧型、序号+反码校验、CRC16/XMODEM（多项式 0x1021）帧级校验、重复包识别（只 ACK 不重写）、单/双 EOT 兼容、CAN 取消。`iap.c`/`iap.h` 实现 IAP 业务层：擦 APP Flash → Ymodem 接收 → 流式写 Flash → CRC32 双重校验 → 更新参数区 → 软复位。
+- **USART1 RX 中断 + 4KB 环形缓冲区**：解决阻塞接收丢字节/ORE/帧错位问题。中断只搬字节（不 printf/不写 Flash/不等超时），ring 吸收发送端和主循环速度差，主循环按协议字段逐字节取。`Y_RX_RING_SIZE=4096`（≥ 4 倍 STX 帧）。
+- **流式 CRC32 公共 API**：`CRC32_StreamReset/Update/Finalize` 三段式接口（复用 D9 运行时查表），IAP 层边收边算，464KB 固件 + 64KB SRAM 场景下无需整包缓冲。接收流 CRC32 vs Flash 回读 CRC32 双重校验，成功值 `0x59B4EA2B` 两边完全一致。
+- **IAP 时序重构**：擦 APP Flash（232 页 ~2 秒）从 Ymodem 回调移到 `IAP_ProcessSerial()` 入口，先擦完再发 `C` 握手，PC 在擦除期间不发包，时序完全错开。回调 `iap_on_packet()` 只做"写当前包 + 累加 CRC32"微秒级操作。
+- **EOT 出参统一更新**：`*received_size = total_received` 移到数据循环外统一处理，所有退出路径（EOT/CRC 错/超时）都能拿到真实接收长度。EOT 后补 `total_received != file_total_size` 硬校验，防"EOT≠文件完整"。
+- **Bootloader 三分支状态机落地**（`main.c`）：① 参数区有 OTA 请求（`ota_request_magic=MAGIC_OTA_REQUEST`）→ 3 秒倒计时按 KEY0 进串口 IAP（先清 OTA 标志防失败死循环）；② KEY0 + Reset 强制进串口 IAP（硬件救砖兜底）；③ APP 有效（`fw_size/fw_crc` 校验通过 + 栈指针合法）→ 跳转 `0x08008000`。
+- **APP 端参数区只读化**：`app_task.c` 把 `fw_size_bytes/fw_crc32` 赋值移到 `FlashParam_Load` 失败的 `else` 分支，参数区有效时 APP 不覆盖 IAP 保存的真实值，D12 OTA 校验语义正确。
+- **D10 所有踩坑修复**：CRC32 表重复 → 公共流式 API；阻塞接收 ORE → 中断+ring；擦 Flash 放回调 → 前置到握手前；EOT 不更新出参 → 循环外统一写；APP 覆盖参数 → 移到 else 分支。
+- **编译 0 Error 0 Warning**，Bootloader + APP 双工程干净通过。硬件实测：Tera Term Ymodem 发 `app.bin`（30268 字节）→ `Pre-erase OK` → `CRC MATCH` → `Param Save OK` → 软复位 → `APP valid, jumping to 0x08008000` → APP 启动（DHT11/RTOS 任务正常运行），救砖通道全闭环。
+- 具备进入 D11（WiFi OTA 远程升级）的条件：Bootloader 已能识别参数区 OTA 请求标志 + 串口 IAP 救砖兜底已就绪，D11 只需在 APP 端通过 MQTT 收到升级命令后写 `ota_request_magic` + 复位即可触发 Bootloader 升级流程。
+
+
