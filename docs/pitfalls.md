@@ -1004,3 +1004,106 @@ D10：Ymodem 串口 IAP 救砖通道（Bootloader 端 Ymodem 接收 + IAP 写 Fl
 - 具备进入 D11（WiFi OTA 远程升级）的条件：Bootloader 已能识别参数区 OTA 请求标志 + 串口 IAP 救砖兜底已就绪，D11 只需在 APP 端通过 MQTT 收到升级命令后写 `ota_request_magic` + 复位即可触发 Bootloader 升级流程。
 
 
+
+
+D11：APP侧OTA请求触发 + MQTT命令解析 + 参数区标志 + 软复位进Bootloader（2026-08-23）
+阶段归属：阶段3 OTA系统架构 · APP侧触发层
+
+---
+
+## 坑1：ESP8266 +IPD 分包导致 ParsePublish 在不完整帧上硬解析 → OTA 命令不触发
+
+- **现象**：MQTT.fx 向 `iot/dev001/ota` 发 OTA JSON，设备串口打印 `[MQTT] RX packet type=0x30, len=10` + `[MQTT] RX PUBLISH topic=iot/de payload=+IPD,5:?`，topic 被截成 `iot/de`，payload 是乱码，OTA 命令永远不触发，设备不复位。
+- **根因**：ESP8266 非透明模式下，`+IPD,101:` 声明的 101 字节 MQTT 数据**可能分多次 RX 到达**。第一次 RX 只到 45 字节（含 AT 回显 26B + `+IPD,101:` 前缀 9B + MQTT 数据前 10B），代码用 `int mqtt_len = rlen - mqtt_start` 取的是**本次 RX 的字节数**（10），不是 +IPD 声明的总长度（101）。ParsePublish 拿到 10 字节就硬解析，remaining length=0x63=99 但缓冲区只有 8 字节数据，解析出错得到 `topic=iot/de`。第二次 RX 的 121 字节是 MQTT 剩余数据，但**没有 +IPD 前缀**，代码不进解析分支，直接丢弃 → OTA 命令的 JSON 永远到不了 ParsePublish。
+- **排查过程**：
+  1. 看 `[MQTT] RX (45 bytes)` 的 hex：`...2B 49 50 44 2C 31 30 31 3A 30 63 00 0E 69 6F 74 2F 64 65` = `+IPD,101:0c\x00\x0eiot/de`，确认 +IPD 声明 101 字节但本次 RX 只到 10 字节
+  2. 看 `len=10` 不是 101 → 代码用了本次 RX 字节数，没用 +IPD 声明的长度
+  3. 看第二次 RX (121 bytes) 开头 `76 30 30 31 2F 6F 74 61 7B...` = `v001/ota{...`，是 MQTT 剩余数据，但没有 +IPD 前缀
+  4. 定位：代码假设一次 RX 收完整 +IPD 数据，没处理分包
+- **解决**：加跨 RX 累积缓冲区，按 +IPD 声明的长度收满再解析：
+  ```c
+  static uint8_t mqtt_accum[256];      /* MQTT 帧累积缓冲区 */
+  static int     mqtt_accum_len = 0;    /* 已累积字节数 */
+  static int     mqtt_expected  = 0;    /* +IPD 声明的总长度，0=没在收 */
+
+  /* 有 +IPD 前缀：提取 declared_len，开始累积 */
+  if (ipd_tag != NULL) {
+      mqtt_expected = atoi(ipd_tag + 5);                /* +IPD,101: → 101 */
+      int copy_len = (mqtt_len < mqtt_expected) ? mqtt_len : mqtt_expected;
+      memcpy(mqtt_accum, &line[mqtt_start], copy_len);
+      mqtt_accum_len = copy_len;
+  }
+  /* 没 +IPD 但 expected>0：拼接后续数据 */
+  else if (mqtt_expected > 0) {
+      int remain   = mqtt_expected - mqtt_accum_len;
+      int copy_len = (rlen < remain) ? rlen : remain;
+      memcpy(mqtt_accum + mqtt_accum_len, line, copy_len);
+      mqtt_accum_len += copy_len;
+  }
+  /* 收满后解析完整帧 */
+  if (mqtt_expected > 0 && mqtt_accum_len >= mqtt_expected) {
+      MQTT_ParsePublish(mqtt_accum, mqtt_accum_len, &topic, &topic_len, &payload, &payload_len);
+      mqtt_expected  = 0;                                /* 清状态，准备收下一帧 */
+      mqtt_accum_len = 0;
+  }
+  ```
+- **教训**：ESP8266 +IPD 数据**不保证一次 RX 收完整**，必须按 +IPD 声明的长度跨 RX 累积。判别特征：日志里 `len=` 远小于 +IPD 声明的长度，且 topic 被截断。后续数据用 `memcpy` 拼接（不用 `strstr`，因为 MQTT 帧含 0x00 字节会被截断）。这是 D7 之后 +IPD 解析的第二个坑——D7 解决了"找 0x30 帧头绕过 +IPD 前缀"，D11 又踩了"+IPD 数据分包"。
+
+## 坑2：Bootloader OTA 请求分支从"串口 IAP 耦合"改为"WiFi 等待死循环"
+
+- **现象**：D10 的 Bootloader main.c 分支1 是"OTA 请求 → 3 秒倒计时按 KEY0 → 进串口 IAP"。D11 要让 OTA 请求触发后进"WiFi OTA 等待"（D12 才拉固件），但直接改会发现：删 `IAP_ProcessSerial` 会导致 `start_iap`/`end_branch1` 标签报 "label defined but not used"；保留又会和死循环冲突；删倒计时会让 `key_pressed` 变量报 "undeclared"。
+- **根因**：D10 把"OTA 请求触发"和"串口 IAP 执行"耦合在分支1 里，3 秒倒计时 + `goto start_iap` + `IAP_ProcessSerial` + `end_branch1` 是一整套流程，互相依赖。D11 要把 OTA 请求改成"等 WiFi 拉固件"，必须整段拆解，不能局部删。
+- **排查过程**：
+  1. 读 main.c 分支1（116-184 行），看到结构：打印 → 清标志 → 3 秒倒计时 → goto start_iap → IAP_ProcessSerial → end_branch1
+  2. 尝试只删 IAP_ProcessSerial → start_iap/end_branch1 标签未使用 warning
+  3. 尝试只删倒计时 → key_pressed 变量 undeclared
+  4. 结论：必须整段替换，不能局部改
+- **解决**：整段替换分支1（117-184 行），删掉 3 秒倒计时 + goto + start_iap + IAP_ProcessSerial + end_branch1，改为"打印 + 清标志 + 死循环 LED0 双闪"：
+  ```c
+  if (load_ok == 0 && g_param_buf.ota_request_magic == MAGIC_OTA_REQUEST)
+  {
+      /* 打印 OTA 请求信息 */
+      printf("[BOOT] OTA_REQUEST FLAG (magic=0x%08X) detected!\r\n", ...);
+      /* 先清标志（防升级失败后复位又进这里死循环）*/
+      FlashParam_ClearOtaRequest();
+      /* 进 WiFi OTA 等待死循环，D12 在这里实现拉固件 */
+      for (;;) {
+          HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
+          HAL_Delay(200);   /* LED0 双闪表示在 Bootloader 等升级 */
+          /* TODO D12: 调 WiFi_IAP_Process() 拉固件 */
+      }
+  }
+  ```
+  串口 IAP 逻辑保留在分支2（KEY0+Reset 强制 IAP）作兜底救砖。
+- **教训**：分支1 的职责要单一——只管"OTA 请求检测 + 进等待状态"，串口 IAP 执行放分支2。职责分离后，D12 在死循环里加拉固件逻辑，不会影响分支2 的串口救砖路径。耦合流程的改造要整段替换，不能局部删（删一个触发连锁 warning）。
+
+---
+
+## D11 成果
+
+| 文件 | 改动 | 作用 |
+|---|---|---|
+| `app/Inc/ota_manager.h` | 新建 | 版本宏 + 3 API 声明（GetBuildNum/ParseCommand/TriggerUpgrade）|
+| `app/Src/ota_manager.c` | 新建 | BUILD哈希(djb2) + JSON解析(strstr) + 写参数区+软复位 |
+| `app/Src/app_esp8266.c` | 加 ota 分支 + 修 +IPD 分包累积 | MQTT 收 ota 命令 → 解析 → 触发升级；跨 RX 累积完整帧 |
+| `bootloader/Core/Src/main.c` | 分支1 改 WiFi 等待死循环 | OTA 请求 → 清标志 → LED0 双闪等 D12 |
+
+**验证通过的完整链路**：
+```
+MQTT.fx 发 {"cmd":"ota",...}
+  → APP +IPD 累积收满 101 字节
+  → ParsePublish 得 topic=iot/dev001/ota + payload
+  → OTA_ParseCommand 解析 size+crc
+  → OTA_TriggerUpgrade 写参数区(OTA1+size+crc)
+  → NVIC_SystemReset 软复位
+  → Bootloader 检测 OTA_REQUEST
+  → 先清标志防死循环
+  → 进 WiFi-OTA 等待（LED0 双闪）
+```
+
+**D11 在 OTA 体系里的定位**：D10（串口本地救砖）和 D12（WiFi 远程拉固件）之间的**触发桥梁**。没有 D11，APP 收到云端命令只会点 LED；没有 D12，D11 触发了复位但 Bootloader 拉不到固件。D11+D12 合起来才是完整远程 OTA。
+
+
+
+
+
