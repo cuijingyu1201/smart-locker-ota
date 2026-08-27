@@ -1,0 +1,11 @@
+*** Using Compiler 'V5.06 update 7 (build 960)', folder: 'D:\keil5-32\ARM\ARMCC\Bin'
+Build target '00_bootloader'
+compiling ymodem.c...
+"no source": Error:  #219: error while deleting file "00_bootloader\ymodem.d": Permission denied
+..\Core\Src\ymodem.c: 0 warnings, 1 error
+compiling iap.c...
+"no source": Error:  #219: error while deleting file "00_bootloader\iap.d": Permission denied
+..\Core\Src\iap.c: 0 warnings, 1 error
+"00_bootloader\00_bootloader.axf" - 2 Error(s), 0 Warning(s).
+Target not created.
+Build Time Elapsed:  00:00:01

@@ -33,3 +33,9 @@ ReleaseConfig/
 *.user
 *.pro.user
 build-*/
+
+.idea/
+traework_dialog_full.txt
+*.bak_utf8
+codex_*.log
+*_build*.log

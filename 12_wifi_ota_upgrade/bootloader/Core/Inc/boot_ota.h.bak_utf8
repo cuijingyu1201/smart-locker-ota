@@ -1,0 +1,57 @@
+#ifndef __BOOT_OTA_H
+#define __BOOT_OTA_H
+
+#include <stdint.h>
+
+/* ================================================================
+ *   D12：Bootloader 端 WiFi OTA 远程拉固件
+ *
+ *   协议：JSON over TCP 9000，4 步 HELLO/INFO/DATA/END
+ *   数据块用 base64 编码（ESP8266 AT 命令帧友好）
+ *   目标 APP 区：0x08008000 ~ 0x0807EFFF（共 464KB）
+ *
+ *   状态机：共 10 态，结构完全对齐 D7 APP 端 ESP 状态机
+ * ================================================================ */
+
+/* ---------- OTA 状态枚举 ---------- */
+typedef enum {
+    BOOT_OTA_IDLE = 0,         /* 空闲，未启动 */
+    BOOT_OTA_ESP_INIT,         /* ESP8266 上电：AT 探测 */
+    BOOT_OTA_ESP_SET_STA,      /* AT+CWMODE=1 切 Station 模式 */
+    BOOT_OTA_ESP_JOIN_WIFI,    /* AT+CWJAP=ssid,pwd 等 WIFI GOT IP */
+    BOOT_OTA_CONN_TCP,         /* AT+CIPSTART="TCP",server_ip,9000 连 PC */
+    BOOT_OTA_SEND_HELLO,       /* 发 HELLO JSON，等 INFO 回复 */
+    BOOT_OTA_RECV_DATA,        /* 循环收 DATA 分包写 Flash */
+    BOOT_OTA_WAIT_END,         /* 等 END 帧，之后双校验 */
+    BOOT_OTA_VERIFY_JUMP,      /* CRC32 双校验 + 写参数记录 + 跳 APP */
+    BOOT_OTA_FAIL,             /* 任意失败：打印告警 + 死等救砖 */
+} BootOtaState_t;
+
+/* ---------- AT/CWJAP/CIPSEND 配置 ---------- */
+#define OTA_WIFI_SSID        "cai"              /* 自家 WiFi 名称（2.4G！） */
+#define OTA_WIFI_PASS        "ccc1234567"       /* WiFi 密码，改成自己的 */
+#define OTA_SERVER_IP        "10.127.21.17"     /* PC 在局域网的 IP，ipconfig 查 */
+#define OTA_SERVER_PORT      9000
+#define OTA_DEVICE_ID        "dev001"
+
+/* 固件版本号（参数区无效时的默认值）*/
+#define FW_VER_MAJOR         1
+#define FW_VER_MINOR         0
+#define FW_VER_PATCH         0
+
+#define OTA_BLOCK_SIZE       1024U              /* 每包 1024B（base64 编码前）*/
+#define OTA_JSON_BUF_SIZE    2048U              /* JSON 缓冲大小（含 base64）*/
+#define OTA_ESP_TIMEOUT_MS   15000U             /* WiFi/TCP 连接总超时 */
+#define OTA_RX_TIMEOUT_MS    30000U             /* 数据接收总超时（30秒无包判失败）*/
+
+/* ---------- AT 命令缓冲最小尺寸（防御性）---------- */
+#define OTA_AT_BUF_SIZE      512U
+
+/* ---------- 对外 API ---------- */
+int  WiFi_IAP_Init(void);                                 /* 初始化 ESP 等待 + 超时 */
+int  WiFi_IAP_Process(uint32_t expect_crc, uint32_t expect_size);
+/* expect_crc/size = 参数区里 APP 写的 ota_new_fw_crc32 / ota_new_fw_size
+ * 内部成功：不返回，直接 JumpToApp 跳新固件
+ * 内部失败：返回非 0，调用方显示失败状态走救砖模式 */
+
+#endif /* __BOOT_OTA_H */

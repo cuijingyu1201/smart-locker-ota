@@ -1,0 +1,830 @@
+/**
+ * @file    boot_ota.c
+ * @brief   D12: Bootloader 端 WiFi OTA 远程拉固件，AT 命令驱动 + 10 态状态机
+ *          步骤 2a：UART AT 驱动层 + 前 4 态（ESP_INIT / SET_STA / JOIN_WIFI / CONN_TCP）
+ *          步骤 2b：协议层（HELLO/INFO/DATA/END + base64 + Flash 写 + 双校验 + JumpToApp）
+ *          注意：Bootloader 无 FreeRTOS，不能用 osDelay / cmsis_os2
+ *               所有延时/超时统一用 HAL_GetTick() + HAL_Delay()
+ */
+#include "boot_ota.h"
+#include "usart.h"            /* huart2（ESP8266 → USART2 PA2 TX / PA3 RX）*/
+#include "flash_if.h"         /* FLASH_EraseAppArea / FLASH_WriteBuf（步骤 2b 使用）*/
+#include "flash_param.h"      /* CRC32_StreamReset / Update / Finalize（步骤 2b 使用）*/
+#include "jump_to_app.h"      /* JumpToApp（步骤 2b 结束使用）*/
+#include "stm32f1xx_hal.h"    /* HAL_GetTick / HAL_Delay / NVIC_SystemReset */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+/* ---------- INFO 帧缓存（分阶段信息，SEND_HELLO 之后跨态使用）---------- */
+typedef struct {
+    uint32_t fw_size;        /* 服务器 INFO.size */
+    uint32_t fw_crc;         /* 服务器 INFO.crc（十进制，非 hex 字符串）*/
+    uint16_t total_packets;  /* 服务器 INFO.packets，DATA 总包数 */
+    uint16_t packet_size;    /* 服务器 INFO.pktsize，每包 base64 前字节数（约定 1024）*/
+} OtaInfo_t;
+
+static OtaInfo_t  g_info;  /* INFO 帧在 SEND_HELLO 赋值，跨态给 RECV_DATA/WAIT_END/VERIFY_JUMP 用 */
+
+/* ---------- 内部缓冲区（static 放 BSS，不占栈）---------- */
+static char     s_at_buf[OTA_AT_BUF_SIZE];     /* 组装 AT 命令用 */
+static char     s_rx_line[OTA_JSON_BUF_SIZE];  /* UART 一行 RX 缓冲（按 \r\n 对齐）*/
+static char     s_json_buf[OTA_JSON_BUF_SIZE]; /* 剥离后的 JSON 帧累积缓冲（步骤 2b 使用）*/
+static uint16_t s_json_len;                    /* 累积 JSON 字节计数（步骤 2b 使用，当前未启用则 warning）*/
+
+/* ---------- 写 Flash 状态变量（步骤 2b 使用）---------- */
+static uint32_t s_write_addr;                  /* 当前写入的 APP Flash 地址 */
+static uint32_t s_recv_total;                  /* 已收到累积总字节数 */
+static uint32_t s_crc_ram;                     /* RAM 流式 CRC32 上下文 */
+
+/* ================================================================
+ *   base64 解码（模块内部用）
+ *   in    : base64 字符串
+ *   inlen : base64 字节长度（不含末尾 \0）
+ *   out   : 解码输出缓冲，调用方提供，至少 inlen*3/4+2 字节
+ *   outmax: 输出缓冲容量
+ *   返回  : 实际解码字节数，失败 -1
+ *   备注  : 纯手写 base64 解码表，避免依赖外部 ASCII 库，代码量小且可控
+ * ================================================================ */
+static int base64_decode(const char *in, int inlen, uint8_t *out, int outmax)
+{
+    /* 运行时初始化 base64 映射表（ARMCC V5 不支持 ['A']=0 这种 C99 指定初始化）*/
+    static uint8_t T[128];
+    static int T_inited = 0;
+    int i = 0, oi = 0;
+    uint32_t x;
+
+    if (!T_inited) {
+        const char *chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        int idx;
+        for (idx = 0; idx < 64; idx++) {
+            T[(uint8_t)chars[idx]] = (uint8_t)idx;
+        }
+        T_inited = 1;
+    }
+
+    while (i + 4 <= inlen) {
+        uint8_t a = (unsigned char)in[i]   < 128 ? T[(unsigned char)in[i]]   : 0xFF;
+        uint8_t b = (unsigned char)in[i+1] < 128 ? T[(unsigned char)in[i+1]] : 0xFF;
+        uint8_t c = (unsigned char)in[i+2] < 128 ? T[(unsigned char)in[i+2]] : 0xFF;
+        uint8_t d = (unsigned char)in[i+3] < 128 ? T[(unsigned char)in[i+3]] : 0xFF;
+        if (a == 0xFF || b == 0xFF) return -1;
+        x = ((uint32_t)a << 18) | ((uint32_t)b << 12);
+        int pcnt = 3;
+        if (in[i + 2] != '=') { if (c == 0xFF) return -1; x |= ((uint32_t)c << 6); } else pcnt = 1;
+        if (in[i + 3] != '=') { if (d == 0xFF) return -1; x |= ((uint32_t)d); } else pcnt = (pcnt == 1) ? 1 : 2;
+        if (oi + pcnt > outmax) return -1;
+        out[oi++] = (uint8_t)(x >> 16);
+        if (pcnt > 1) out[oi++] = (uint8_t)(x >> 8);
+        if (pcnt > 2) out[oi++] = (uint8_t)x;
+        i += 4;
+    }
+    return oi;
+}
+
+/* ================================================================
+ *   JSON 长整型字段提取（思路对齐 APP 端 parse_long）
+ *   返回 -1=没找到，>=0=正确十进制解析值
+ * ================================================================ */
+static long json_get_long(const char *json, const char *key)
+{
+    char pat[32];
+    int  n = snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p;
+    if (n <= 0 || n >= (int)sizeof(pat)) return -1;
+    p = strstr(json, pat);
+    if (!p) return -1;
+    p += n;
+    while (*p == ' ' || *p == '\t') p++;
+    return strtol(p, NULL, 10);
+}
+
+/* ================================================================
+ *   JSON 无符号长整型字段提取（专用于 CRC32，避免 strtol 截断）
+ *   *found: 1=找到该字段, 0=未找到；通过指针返回是否命中而非返回值
+ * ================================================================ */
+static unsigned long json_get_ulong(const char *json, const char *key, int *found)
+{
+    char pat[32];
+    int  n = snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p;
+    if (found) *found = 0;
+    if (n <= 0 || n >= (int)sizeof(pat)) return 0;
+    p = strstr(json, pat);
+    if (!p) return 0;
+    p += n;
+    while (*p == ' ' || *p == '\t') p++;
+    if (found) *found = 1;
+    return strtoul(p, NULL, 10);
+}
+
+/* ================================================================
+ *   JSON 字符串字段提取：例 "dev":"dev001" → out="dev001"
+ *   只支持无转义的简单字符串（OTA HELLO/INFO 字段无转义，足够）
+ *   返回 1=找到，0=未找到
+ *   预留函数（当前协议只用整数型字段），保留供后续扩展 JSON 字符串字段。
+ * ================================================================ */
+__attribute__((unused)) static int json_get_str(const char *json, const char *key, char *out, int outmax)
+{
+    char pat[32];
+    int  n = snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p, *q;
+    int  i;
+    if (n <= 0 || n >= (int)sizeof(pat)) return 0;
+    p = strstr(json, pat);
+    if (!p) return 0;
+    p += n;
+    q = strchr(p, '"');
+    if (!q) return 0;
+    n = (int)(q - p);
+    if (n >= outmax) n = outmax - 1;
+    for (i = 0; i < n; i++) out[i] = p[i];
+    out[i] = '\0';
+    return 1;
+}
+
+/* ================================================================
+ *   去除 "+IPD,N:" 前缀的一帧处理（兼容 uart_read_line 一次一帧累积）
+ *   服务器 4 种帧："type":"HELLO" / "INFO" / "DATA" / "END"
+ *   服务器侧每帧末尾加 \r\n，uart_read_line 自动按 \r\n 截断 → 保证一行就是一帧 JSON
+ *   本函数统一做法：如果 rx line 里带 "+IPD,N:" 前缀就剥掉，否则原样复制 JSON
+ *   line     : 原始 rx line（可能带 +IPD,101: 前缀的 JSON）
+ *   out      : 输出纯 JSON，剥掉 +IPD 头
+ *   outmax   : 输出缓冲字节数
+ *   返回     : 纯 JSON 长度（字节），0=缓冲里既无 +IPD 也无有效 JSON
+ * ================================================================ */
+static int strip_ipd(const char *line, char *out, int outmax)
+{
+    const char *ipd = strstr(line, "+IPD,");
+    int len;
+    if (ipd != NULL) {
+        char *colon = strchr(ipd + 5, ':');
+        if (colon == NULL) return 0;
+        line = colon + 1;   /* 跳过 "+IPD,N:" */
+    }
+    len = (int)strlen(line);
+    if (len >= outmax) len = outmax - 1;
+    memcpy(out, line, len);
+    out[len] = '\0';
+    return len;
+}
+
+/* ================================================================
+ *   UART 收发层：直接读写 huart2（Bootloader 单线程，轮询+超时）
+ *   ESP8266 ↔ STM32F103ZET6：USART2（PA2 TX / PA3 RX）
+ *   波特率：115200（APP 端 MX_USART2_UART_Init 已对齐，两边完全一致）
+ * ================================================================ */
+
+/**
+ * @brief  发送指定字节数（直接 HAL_UART_Transmit，1s 超时）
+ */
+static void uart_send(const char *buf, uint16_t len)
+{
+    if (buf == NULL || len == 0) return;
+    HAL_UART_Transmit(&huart2, (uint8_t *)buf, len, 1000);
+}
+
+/**
+ * @brief  发送 C 字符串（strlen 取长度）
+ */
+static void uart_send_str(const char *s)
+{
+    if (s == NULL) return;
+    uart_send(s, (uint16_t)strlen(s));
+}
+
+/**
+ * @brief  轮询读一行，直到遇到 \r\n 或 timeout_ms
+ * @param  out        输出字符串（用户提供缓冲，末尾自动加 \0）
+ * @param  max        输出缓冲最大字节数（含末尾 \0）
+ * @param  timeout_ms 总超时毫秒
+ * @return 实际读取字节数（不含末尾自动截断的 \r\n 及终止 \0），超时可能为部分字节
+ * @note   逐字节 10ms 轮询（HAL_UART_Receive 单字节 10ms 超时）
+ *         这种策略吞吐较低，但每 10ms 就出让总线，避免硬阻塞造成总超时失精度
+ */
+static uint16_t uart_read_line(char *out, uint16_t max, uint32_t timeout_ms)
+{
+    uint16_t n = 0;
+    uint8_t  b;
+    uint32_t start = HAL_GetTick();
+    if (out == NULL || max == 0) return 0;
+    out[0] = '\0';
+
+    while (HAL_GetTick() - start < timeout_ms) {
+        if (HAL_UART_Receive(&huart2, &b, 1, 10) == HAL_OK) {
+            if (n + 1 < max) {
+                out[n++] = (char)b;
+                out[n]   = '\0';
+                /* 遇到 \r\n 就截断（丢弃 \r\n 本身作为帧终止符）*/
+                if (n >= 2 && out[n - 2] == '\r' && out[n - 1] == '\n') {
+                    out[n - 2] = '\0';
+                    return (uint16_t)(n - 2);
+                }
+            } else {
+                /* 缓冲已满强制截断（这种情况大概率是脏数据，直接停）*/
+                out[max - 1] = '\0';
+                return (uint16_t)(max - 1);
+            }
+        }
+    }
+    return n;   /* 超时：返回已读取部分（可能不完整，调用方处理）*/
+}
+
+/* ================================================================
+ *   AT+CIPSEND + 发送 payload：封装标准 CIPSEND 模式流程
+ *   流程：
+ *     1) AT+CIPSEND=<len>
+ *     2) 等 '>' 提示符
+ *     3) 发 payload 字节
+ *     4) 等 SEND OK
+ *   成功返回 1，失败返回 0
+ *   注意：<len> 必须是 snprintf 实际返回的 JSON 字节数（不含末尾 \0）
+ *        如果误传 strlen(json_str) 而且字符串中间包含 0 字节，两者长度不一致会导致
+ *        ESP8266 TCP 端报长度不匹配，最终 SEND FAIL（D7/D11 反复踩过的坑）
+ * ================================================================ */
+static int cip_send(const char *payload, int len)
+{
+    int n;
+    uint16_t r;
+    uint32_t t;
+    if (len <= 0) return 0;
+
+    n = snprintf(s_at_buf, sizeof(s_at_buf), "AT+CIPSEND=%d\r\n", len);
+    if (n <= 0 || n >= (int)sizeof(s_at_buf)) return 0;
+    uart_send_str(s_at_buf);
+
+    /* Step2：等 '>'，1 秒超时 */
+    t = HAL_GetTick();
+    for (;;) {
+        r = uart_read_line(s_rx_line, sizeof(s_rx_line), 200);
+        if (r > 0) {
+            printf("[ESP] %s\r\n", s_rx_line);
+            if (strchr(s_rx_line, '>') != NULL) break;
+            if (strstr(s_rx_line, "ERROR") != NULL) return 0;
+            if (strstr(s_rx_line, "CLOSED") != NULL) return 0;
+        }
+        if (HAL_GetTick() - t > 1000) return 0;
+    }
+
+    /* Step3：发 payload（按字节数精确发送，不含末尾 \0）*/
+    uart_send(payload, (uint16_t)len);
+
+    /* Step4：等 SEND OK，最长 3 秒 */
+    t = HAL_GetTick();
+    for (;;) {
+        r = uart_read_line(s_rx_line, sizeof(s_rx_line), 200);
+        if (r > 0) {
+            printf("[ESP] %s\r\n", s_rx_line);
+            if (strstr(s_rx_line, "SEND OK") != NULL) return 1;
+            if (strstr(s_rx_line, "ERROR") != NULL) return 0;
+            if (strstr(s_rx_line, "CLOSED") != NULL) return 0;
+            /* "busy" 状态暂时忽略，继续轮询 */
+        }
+        if (HAL_GetTick() - t > 3000) return 0;
+    }
+}
+
+/**
+ * @brief  发 AT 命令 + 轮询等待期望 expect_str，命中 ERROR/FAIL 立即报失败
+ * @param  cmd        要发送的 AT 命令（含 \r\n）
+ * @param  expect     成功关键字，例 "OK" / "WIFI GOT IP" / "CONNECT"
+ * @param  timeout_ms 总等待超时（ms）
+ * @return 1 = 命中 expect 成功，0 = 超时或读到 ERROR/FAIL
+ * @note   收到中间行时通过 printf("[ESP] ...") 打印转发到串口调试器
+ *         行为与 D7 APP 端 `[ESP]` 打印完全一致，便于对照调试
+ */
+static int at_cmd_expect(const char *cmd, const char *expect, uint32_t timeout_ms)
+{
+    uint16_t n;
+    uint32_t t;
+    if (cmd == NULL || expect == NULL) return 0;
+
+    uart_send_str(cmd);   /* 先发完整命令出去 */
+
+    t = HAL_GetTick();
+    while (HAL_GetTick() - t < timeout_ms) {
+        n = uart_read_line(s_rx_line, sizeof(s_rx_line), 200);
+        if (n > 0) {
+            printf("[ESP] %s\r\n", s_rx_line);
+            /* 成功：命中 expect 关键字 */
+            if (strstr(s_rx_line, expect) != NULL) {
+                return 1;
+            }
+            /* 硬失败：ERROR / FAIL 直接返回超时路径 */
+            if (strstr(s_rx_line, "ERROR") != NULL) {
+                return 0;
+            }
+            if (strstr(s_rx_line, "FAIL")  != NULL) {
+                return 0;
+            }
+        }
+    }
+    return 0;   /* 超时 */
+}
+
+/* ================================================================
+ *   WiFi_IAP_Init：ESP8266 硬件上电等待阶段
+ *   Hard Constraints：ESP8266 冷启动至少 3~5 秒后才响应 AT 命令
+ *   这里包含内部 bootloader 加载 + WiFi MAC 初始化等不可跳过延迟
+ *   等满 3 秒，保证之后第一轮 AT test 不再出现"上电就无响应"的虚失败
+ *   如果有 ESP_EN / ESP_RST 接到 STM32 GPIO，优先用硬件复位替代纯延时（更可靠）
+ * ================================================================ */
+int WiFi_IAP_Init(void)
+{
+    s_json_len = 0;
+    printf("[WIFI-OTA] Init: wait ESP8266 boot 3s (Hard Constraints)\r\n");
+    HAL_Delay(3000);   /* 硬等 3000ms，不足再加大 */
+    printf("[WIFI-OTA] Init done, ESP8266 should be ready for AT.\r\n");
+    return 0;
+}
+
+/* ================================================================
+ *   WiFi_IAP_Process：核心函数，OTA 拉固件状态机主循环
+ *   入参 expect_crc  = APP 写在参数区的 ota_new_fw_crc32
+ *         expect_size = APP 写在参数区的 ota_new_fw_size
+ *         这两个值会填进 HELLO 帧发给服务器，服务器据此二次校验匹配 app.bin
+ *         crc/size 不匹配直接拒绝——防止"设备以为要 A 版本实际服务器发的是 B 版本"
+ *   成功：函数内 VERIFY_JUMP 调用 JumpToApp 后不再返回，新固件运行
+ *         任一失败：切 BOOT_OTA_FAIL 死循环锁死，用户走救砖 KEY0+Reset 路径
+ *
+ *   状态机拓扑：
+ *   BOOT_OTA_ESP_INIT  →(AT OK)→ BOOT_OTA_ESP_SET_STA
+ *        ↓                          ↓(AT+CWMODE OK)
+ *        ↓(失败)                   ↓
+ *   BOOT_OTA_FAIL  ←(任意失败)←  BOOT_OTA_ESP_JOIN_WIFI
+ *                                   ↓ (WIFI GOT IP)
+ *                               BOOT_OTA_CONN_TCP
+ *                                   ↓ (CIPSTART CONNECT)
+ *                              BOOT_OTA_SEND_HELLO  (步骤 2b 实现)
+ *                                   ↓
+ *                              BOOT_OTA_RECV_DATA    (步骤 2b 实现)
+ *                                   ↓
+ *                              BOOT_OTA_WAIT_END     (步骤 2b 实现)
+ *                                   ↓
+ *                           BOOT_OTA_VERIFY_JUMP     (步骤 2b 实现)
+ *                                   ↓(任一步失败)
+ *                               BOOT_OTA_FAIL
+ * ================================================================ */
+int WiFi_IAP_Process(uint32_t expect_crc, uint32_t expect_size)
+{
+    BootOtaState_t state     = BOOT_OTA_ESP_INIT;
+    uint32_t       t_enter   = HAL_GetTick();   /* 进入当前态的时间戳（用于超时判断）*/
+    uint32_t       saved_crc  = expect_crc;     /* 跨态保存（步骤 2b 使用）*/
+    uint32_t       saved_size = expect_size;    /* 跨态保存（步骤 2b 使用）*/
+
+    (void)s_json_len;   /* 预留累积 JSON 计数器，当前按行解析暂未启用，防 unused warning */
+
+    for (;;) {
+        uint32_t now = HAL_GetTick();
+
+        switch (state) {
+
+        /* ============================================================
+         *   态 1：ESP_INIT 发 AT 探测
+         *   操作：发 "AT\r\n"，3 秒内等 "OK"
+         *   成功：确认 ESP8266 AT 通道正常，UART 链路无问题
+         *   失败：切 BOOT_OTA_FAIL（ESP 无响应，模块没上电或线序错）
+         * ============================================================ */
+        case BOOT_OTA_ESP_INIT:
+            printf("[WIFI-OTA] [S1] ESP init: AT test\r\n");
+            if (at_cmd_expect("AT\r\n", "OK", 3000)) {
+                state   = BOOT_OTA_ESP_SET_STA;
+                t_enter = now;
+            } else {
+                printf("[WIFI-OTA] [S1] !!! FAIL: ESP no AT response. Reset module or retry.\r\n");
+                state = BOOT_OTA_FAIL;
+            }
+            break;
+
+        /* ============================================================
+         *   态 2：SET_STA 发 AT+CWMODE=1 设 Station 模式
+         *   ESP8266 默认可能是 AP+STA 或纯 AP，只有 STA 才能走外部路由 WiFi
+         *   单状态单命令（不需要 t_enter 细判断，但统一保留写法便于跟踪）
+         * ============================================================ */
+        case BOOT_OTA_ESP_SET_STA:
+            printf("[WIFI-OTA] [S2] Set CWMODE=1 (STA mode)\r\n");
+            if (at_cmd_expect("AT+CWMODE=1\r\n", "OK", 3000)) {
+                state   = BOOT_OTA_ESP_JOIN_WIFI;
+                t_enter = now;
+            } else {
+                printf("[WIFI-OTA] [S2] !!! FAIL: CWMODE not accepted.\r\n");
+                state = BOOT_OTA_FAIL;
+            }
+            break;
+
+        /* ============================================================
+         *   态 3：JOIN_WIFI 连 WiFi，等 WIFI GOT IP
+         *   CWJAP 只发一次（static cmd_sent 控制），之后每 200ms 轮询一次回复
+         *   注意：D7 经验点：CWJAP 是异步命令，ESP8266 先回 "OK" 只表示命令接受
+         *       真正成功是异步等 "WIFI GOT IP"（DHCP 成功）
+         *       中间态 "WIFI CONNECTED" 表示链路层已连上，必须等到 GOT IP 才算成功
+         *   失败：D7 经验点 +CWJAP:1 / ERROR / FAIL 直接判失败；
+         *           只有 "WIFI DISCONNECT" 是可重试中间态，不算失败（D7/D11 反复验证）
+         * ============================================================ */
+        case BOOT_OTA_ESP_JOIN_WIFI: {
+            static int cmd_sent = 0;   /* 控制只在本态第一次进来时发 CWJAP，循环中不要重复发 */
+            if (!cmd_sent) {
+                snprintf(s_at_buf, sizeof(s_at_buf),
+                                 "AT+CWJAP=\"%s\",\"%s\"\r\n",
+                                 OTA_WIFI_SSID, OTA_WIFI_PASS);
+                printf("[WIFI-OTA] [S3] Join WiFi SSID=%s ...\r\n", OTA_WIFI_SSID);
+                uart_send_str(s_at_buf);
+                cmd_sent = 1;
+            }
+            {
+                uint16_t n = uart_read_line(s_rx_line, sizeof(s_rx_line), 200);
+                if (n > 0) {
+                    printf("[ESP] %s\r\n", s_rx_line);
+                    /* 成功命中 */
+                    if (strstr(s_rx_line, "WIFI GOT IP") != NULL) {
+                        printf("[WIFI-OTA] [S3] WiFi got IP OK.\r\n");
+                        state   = BOOT_OTA_CONN_TCP;
+                        t_enter = now;
+                        break;
+                    }
+                    /* 硬失败：+CWJAP:1 错误码 / ERROR / FAIL */
+                    if (strstr(s_rx_line, "+CWJAP:")   != NULL ||
+                        strstr(s_rx_line, "ERROR")     != NULL ||
+                        strstr(s_rx_line, "FAIL")      != NULL) {
+                        printf("[WIFI-OTA] [S3] !!! FAIL: join WiFi error.\r\n");
+                        state = BOOT_OTA_FAIL;
+                        break;
+                    }
+                    /* "WIFI CONNECTED" 是中间态，继续等 GOT IP 即可（不打印）*/
+                    /* "WIFI DISCONNECT" 是异步中间态（先忽略重试），D7/D11 经验点：允许 */
+                }
+            }
+            if (now - t_enter > OTA_ESP_TIMEOUT_MS) {
+                printf("[WIFI-OTA] [S3] !!! FAIL: WiFi join timeout %lu ms.\r\n",
+                       (unsigned long)OTA_ESP_TIMEOUT_MS);
+                state = BOOT_OTA_FAIL;
+            }
+            break;
+        }
+
+        /* ============================================================
+         *   态 4：CONN_TCP 发 AT+CIPSTART 连 PC Python OTA Server
+         *   当前配置：PC IP 10.127.21.17 端口 9000（不要跟 broker.emqx.io 混了）
+         *   连接请求也只发一次（static cmd_sent 控制），之后轮询 CONNECT / CLOSED / ERROR
+         *   CIPSEND 使用普通模式（非透传），默认就是，不需要额外设 CIPMODE
+         * ============================================================ */
+        case BOOT_OTA_CONN_TCP: {
+            static int cmd_sent = 0;   /* 控制只发一次 CIPSTART */
+            if (!cmd_sent) {
+                snprintf(s_at_buf, sizeof(s_at_buf),
+                                 "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n",
+                                 OTA_SERVER_IP, OTA_SERVER_PORT);
+                printf("[WIFI-OTA] [S4] Connect TCP %s:%d ...\r\n",
+                             OTA_SERVER_IP, OTA_SERVER_PORT);
+                uart_send_str(s_at_buf);
+                cmd_sent = 1;
+            }
+            {
+                uint16_t n = uart_read_line(s_rx_line, sizeof(s_rx_line), 200);
+                if (n > 0) {
+                    printf("[ESP] %s\r\n", s_rx_line);
+                    /* 命中 CONNECT 或 CONNECT OK 均视为成功 */
+                    if (strstr(s_rx_line, "CONNECT") != NULL) {
+                        printf("[WIFI-OTA] [S4] TCP connect OK.\r\n");
+                        state   = BOOT_OTA_SEND_HELLO;
+                        t_enter = now;
+                        break;
+                    }
+                    /* 对端关闭或路由错误 */
+                    if (strstr(s_rx_line, "CLOSED") != NULL || strstr(s_rx_line, "ERROR") != NULL)
+                    {
+                        printf("[WIFI-OTA] [S4] !!! FAIL: TCP connect fail.\r\n");
+                        state = BOOT_OTA_FAIL;
+                        break;
+                    }
+                }
+            }
+            if (now - t_enter > 5000) {    /* TCP 连接 5 秒总超时 */
+                printf("[WIFI-OTA] [S4] !!! FAIL: TCP connect timeout 5000ms.\r\n");
+                state = BOOT_OTA_FAIL;
+            }
+            break;
+        }
+
+        /* ============================================================
+         *   态 5：SEND_HELLO 发 HELLO(JSON)，等 INFO(JSON) 回复
+         *   HELLO: {"type":"HELLO","dev":"dev001",
+         *           "expect_crc":NNNN,"expect_size":NNNN}
+         *   INFO : {"type":"INFO","size":N,"crc":N,"packets":N,"pktsize":N}
+         * ============================================================ */
+        case BOOT_OTA_SEND_HELLO: {
+            static int sent = 0;           /* 0=还没发 HELLO，只发一次 */
+            if (!sent) {
+                int hello_len = snprintf(s_at_buf, sizeof(s_at_buf),
+                    "{\"type\":\"HELLO\",\"dev\":\"%s\",\"expect_crc\":%lu,\"expect_size\":%lu}",
+                    OTA_DEVICE_ID,
+                    (unsigned long)saved_crc,
+                    (unsigned long)saved_size);
+                printf("[WIFI-OTA] [S5] HELLO dev=%s crc=0x%08lX size=%lu bytes\r\n",
+                       OTA_DEVICE_ID, (unsigned long)saved_crc, (unsigned long)saved_size);
+                if (cip_send(s_at_buf, hello_len)) {
+                    sent = 1;
+                    t_enter = now;   /* 重置计时，等 INFO 回复 10 秒 */
+                } else {
+                    printf("[WIFI-OTA] [S5] HELLO CIPSEND FAIL\r\n");
+                    state = BOOT_OTA_FAIL;
+                    break;
+                }
+            }
+            /* 轮询等 INFO 回复 */
+            {
+                uint16_t   r = uart_read_line(s_rx_line, sizeof(s_rx_line), 200);
+                if (r > 0) {
+                    int jl = strip_ipd(s_rx_line, s_json_buf, sizeof(s_json_buf));
+                    if (jl > 0 && strstr(s_json_buf, "\"type\":\"INFO\"") != NULL) {
+                        /* 解析 INFO 各字段 */
+                        long   fsize  = json_get_long  (s_json_buf, "size");
+                        int    crc_ok = 0;
+                        unsigned long fcrc = json_get_ulong(s_json_buf, "crc", &crc_ok);
+                        long   fpkt   = json_get_long  (s_json_buf, "packets");
+                        long   fpksz  = json_get_long  (s_json_buf, "pktsize");
+                        /* 统一写入局部 info 结构体做合法性检测 */
+                        {
+                            OtaInfo_t info_local;
+                            info_local.fw_size = (fsize > 0) ? (uint32_t)fsize : 0;
+                            info_local.fw_crc  = crc_ok ? (uint32_t)fcrc : 0;
+                            info_local.total_packets = (fpkt > 0) ? (uint16_t)fpkt : 0;
+                            info_local.packet_size   = (fpksz > 0) ? (uint16_t)fpksz : 0;
+                            if (info_local.fw_size == 0 || info_local.total_packets == 0 ||
+                                info_local.packet_size   == 0) {
+                                printf("[WIFI-OTA] [S5] INFO invalid (size/pkts/pktsize=0)\r\n");
+                                state = BOOT_OTA_FAIL;
+                                break;
+                            }
+                            if (info_local.fw_size > APP_FLASH_SIZE) {
+                                printf("[WIFI-OTA] [S5] INFO.size=%lu > APP_FLASH_SIZE(%lu)!\r\n",
+                                       (unsigned long)info_local.fw_size,
+                                       (unsigned long)APP_FLASH_SIZE);
+                                state = BOOT_OTA_FAIL;
+                                break;
+                            }
+                            /* 参数区指定的 crc/size 与服务器返回不一致 → 直接拒绝（版本错配）*/
+                            if ((saved_crc  != 0xFFFFFFFF && info_local.fw_crc  != saved_crc ) ||
+                                (saved_size != 0xFFFFFFFF && info_local.fw_size != saved_size)) {
+                                printf("[WIFI-OTA] [S5] !!! MISMATCH: param crc=0x%08lX size=%lu, "
+                                       "server crc=0x%08lX size=%lu\r\n",
+                                       (unsigned long)saved_crc, (unsigned long)saved_size,
+                                       (unsigned long)info_local.fw_crc, (unsigned long)info_local.fw_size);
+                                state = BOOT_OTA_FAIL;
+                                break;
+                            }
+                            printf("[WIFI-OTA] [S5] INFO OK: size=%lu crc=0x%08lX "
+                                   "packets=%u pktsize=%u\r\n",
+                                   (unsigned long)info_local.fw_size,
+                                   (unsigned long)info_local.fw_crc,
+                                   info_local.total_packets, info_local.packet_size);
+
+                            /* 准备写 Flash：擦除 APP 区 + 初始化 CRC 流 + 地址指针归零 */
+                            printf("[WIFI-OTA] [S5] Erasing APP flash (464KB)...\r\n");
+                            if (FLASH_EraseAppArea() != HAL_OK) {
+                                printf("[WIFI-OTA] [S5] Erase FAIL\r\n");
+                                state = BOOT_OTA_FAIL;
+                                break;
+                            }
+                            printf("[WIFI-OTA] [S5] Erase OK\r\n");
+                            CRC32_StreamReset(&s_crc_ram);
+                            s_write_addr = APP_FLASH_START;
+                            s_recv_total = 0;
+                            /* info_local 要跨态 6/7/8 使用，不能放栈里（栈上局部大结构体作用域仅当前态，
+                             * 离开后内容不定；另外 Bootloader 栈小，大结构体堆在栈上也不安全）
+                             * 方案：直接赋值到文件作用域的全局 g_info（和 info_local 同类型，逐字节拷贝）
+                             * 步骤 2b.3 之后的代码只需直接引用 g_info 即可，不再重复 extern 声明 */
+                            g_info = info_local;
+                            state   = BOOT_OTA_RECV_DATA;
+                            t_enter = now;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (now - t_enter > 10000) {    /* 10 秒没 INFO 回复 → 对端可能不是 OTA 服务器 */
+                printf("[WIFI-OTA] [S5] !!! INFO wait timeout 10s (server not OTA server?)\r\n");
+                state = BOOT_OTA_FAIL;
+            }
+            break;
+        }
+
+        /* ============================================================
+         *   态 6：RECV_DATA 循环收 DATA 分包，base64 解码，写 Flash + 流式 CRC
+         *   JSON 格式：{"type":"DATA","seq":N,"data":"<base64 1024B>"}
+         *   每 10% 打印进度（对齐 Qt Tab 进度条的 10 级步进展示）
+         * ============================================================ */
+        case BOOT_OTA_RECV_DATA: {
+            uint16_t r = uart_read_line(s_rx_line, sizeof(s_rx_line), 200);
+            if (r > 0) {
+                int jl = strip_ipd(s_rx_line, s_json_buf, sizeof(s_json_buf));
+                if (jl > 0 && strstr(s_json_buf, "\"type\":\"DATA\"") != NULL) {
+                    long       seq  = json_get_long(s_json_buf, "seq");
+                    static char       b64[1400]; int b64len;
+                    static uint8_t    dec[1024 + 4]; int declen;
+                    static uint8_t    write_buf[1024]; uint16_t write_len;
+                    if (seq < 0) { printf("[WIFI-OTA] [S6] bad seq\r\n"); state = BOOT_OTA_FAIL; break; }
+
+                    /* 提取 data 字段（base64 字符串）*/
+                    {
+                        char pat[16]; int n = snprintf(pat, sizeof(pat), "\"data\":\"");
+                        const char *p = strstr(s_json_buf, pat);
+                        const char *q; int i;
+                        if (p == NULL) { printf("[WIFI-OTA] [S6] no data field\r\n"); state = BOOT_OTA_FAIL; break; }
+                        p += n;
+                        q = strchr(p, '"');
+                        if (q == NULL) { printf("[WIFI-OTA] [S6] data not closed\r\n"); state = BOOT_OTA_FAIL; break; }
+                        b64len = (int)(q - p);
+                        if (b64len >= (int)sizeof(b64)) b64len = (int)sizeof(b64) - 1;
+                        for (i = 0; i < b64len; i++) b64[i] = p[i];
+                        b64[i] = '\0';
+                    }
+
+                    /* base64 解码 → 原始 1024B（最后一包不足一整块正常）*/
+                    declen = base64_decode(b64, b64len, dec, sizeof(dec));
+                    if (declen <= 0) { printf("[WIFI-OTA] [S6] base64 decode FAIL\r\n"); state = BOOT_OTA_FAIL; break; }
+
+                    /* 最后一包不能超过 g_info.fw_size - s_recv_total 的差额 */
+                    write_len = (uint16_t)declen;
+                    if (write_len > sizeof(write_buf)) write_len = (uint16_t)sizeof(write_buf);  /* 防御性钳位 */
+                    if (s_recv_total + write_len > g_info.fw_size) {
+                        write_len = (uint16_t)(g_info.fw_size - s_recv_total);
+                    }
+                    memcpy(write_buf, dec, write_len);
+
+                    /* 写 Flash */
+                    if (FLASH_WriteBuf(s_write_addr, write_buf, write_len) != write_len) {
+                        printf("[WIFI-OTA] [S6] seq=%ld Flash_WriteBuf FAIL @ 0x%08lX\r\n",
+                               seq, (unsigned long)s_write_addr);
+                        state = BOOT_OTA_FAIL;
+                        break;
+                    }
+                    CRC32_StreamUpdate(&s_crc_ram, write_buf, write_len);
+                    s_recv_total += write_len;
+                    s_write_addr += write_len;
+                    t_enter = now;   /* 每收到一包就刷新看门狗计时器，避免长时间"假接收"被判超时 */
+
+                    /* 进度打印：每 10% 变化才打一次（日志收敛）*/
+                    {
+                        static int last_pct = -1;
+                        int pct = g_info.fw_size ? (int)((s_recv_total * 100UL) / g_info.fw_size) : 0;
+                        if (pct != last_pct) {
+                            printf("[WIFI-OTA] [S6] OTA %3d%% (%lu/%lu bytes, seq=%ld)\r\n",
+                                   pct, (unsigned long)s_recv_total, (unsigned long)g_info.fw_size, seq);
+                            last_pct = pct;
+                        }
+                    }
+                }
+                /* 也可能在某条 DATA 帧之后直接跟随 END 帧 → 提前转 WAIT_END 支持一次读完 */
+                else if (jl > 0 && strstr(s_json_buf, "\"type\":\"END\"") != NULL) {
+                    state   = BOOT_OTA_WAIT_END;
+                    t_enter = now;
+                    break;
+                }
+            }
+
+            /* 全部收完后 2 秒仍没 END 帧的兜底超时推进 */
+            {
+                if (s_recv_total >= g_info.fw_size &&
+                    now - t_enter > 2000) {
+                    /* 可能服务器没发 END，直接走到 WAIT_END（即使少 END 帧，
+                     * WAIT_END 之后还会双校验，CRC 对不上照样判失败，不会刷坏固件）*/
+                    state   = BOOT_OTA_WAIT_END;
+                    t_enter = now;
+                    break;
+                }
+            }
+            if (now - t_enter > OTA_RX_TIMEOUT_MS) {   /* 30 秒没收到任何新包 → 对端掉线 */
+                printf("[WIFI-OTA] [S6] !!! DATA recv timeout %lu ms. got=%lu/%lu\r\n",
+                       (unsigned long)OTA_RX_TIMEOUT_MS,
+                       (unsigned long)s_recv_total,
+                       (unsigned long)(g_info.fw_size));
+                state = BOOT_OTA_FAIL;
+            }
+            break;
+        }
+
+        /* ============================================================
+         *   态 7：WAIT_END 等 END 帧（可选），无条件转 VERIFY_JUMP
+         *   上一状态已经在 DATA 态顺手读到 END 时会提前跳转
+         *   这里只补做一次漏网 END 日志打印（如果最后一帧就是 END），之后直接走校验
+         * ============================================================ */
+        case BOOT_OTA_WAIT_END:
+            /* 最后再抓一次还在尾端挂着但尚未消费的 END（防止 DATA 里刚好没有顺手触发的场景）*/
+            {
+                uint16_t r = uart_read_line(s_rx_line, sizeof(s_rx_line), 100);
+                if (r > 0) {
+                    int jl = strip_ipd(s_rx_line, s_json_buf, sizeof(s_json_buf));
+                    if (jl > 0 && strstr(s_json_buf, "\"type\":\"END\"") != NULL) {
+                        long total = json_get_long(s_json_buf, "total_bytes");
+                        if (total > 0) {
+                            printf("[WIFI-OTA] [S7] END: server total_bytes=%ld, we got %lu\r\n",
+                                   total, (unsigned long)s_recv_total);
+                        }
+                    }
+                }
+            }
+            state   = BOOT_OTA_VERIFY_JUMP;
+            t_enter = now;
+            break;
+
+        /* ============================================================
+         *   态 8：VERIFY_JUMP → CRC32 双校验 + 写参数记录 + JumpToApp
+         *   三重校验（必须全过）：
+         *     1) RAM 流式 CRC32 == INFO.crc（服务器声明的固件 CRC）
+         *     2) RAM 流式 CRC32 == 从 APP Flash 读回 CRC32（没写错字节/地址）
+         *     3) s_recv_total == INFO.size（字节总数一致）
+         *   全过 → 写参数区记录本次新固件 size/crc/build 后跳 APP
+         *   任一不过 → FAIL 态锁死等救砖
+         * ============================================================ */
+        case BOOT_OTA_VERIFY_JUMP: {
+            uint32_t crc_final = CRC32_StreamFinalize(&s_crc_ram);
+            uint32_t crc_flash = CRC32_Calc((const uint8_t *)APP_FLASH_START, s_recv_total);
+            int fail = 0;
+
+            printf("[WIFI-OTA] [S8] Verify\r\n");
+            printf("[WIFI-OTA] [S8]   recv_bytes       = %lu (INFO.size=%lu)\r\n",
+                   (unsigned long)s_recv_total, (unsigned long)g_info.fw_size);
+            printf("[WIFI-OTA] [S8]   CRC_stream(RAM)  = 0x%08lX\r\n", (unsigned long)crc_final);
+            printf("[WIFI-OTA] [S8]   CRC_readback(APP) = 0x%08lX (INFO.crc=0x%08lX)\r\n",
+                   (unsigned long)crc_flash, (unsigned long)g_info.fw_crc);
+
+            if (s_recv_total != g_info.fw_size) {
+                printf("[WIFI-OTA] [S8] !!! SIZE MISMATCH recv=%lu != INFO.size=%lu\r\n",
+                       (unsigned long)s_recv_total, (unsigned long)g_info.fw_size);
+                fail = 1;
+            }
+            if (crc_final != g_info.fw_crc) {
+                printf("[WIFI-OTA] [S8] !!! CRC_STREAM MISMATCH 0x%08lX != 0x%08lX\r\n",
+                       (unsigned long)crc_final, (unsigned long)g_info.fw_crc);
+                fail = 1;
+            }
+            if (crc_final != crc_flash) {
+                printf("[WIFI-OTA] [S8] !!! CRC_STREAM != CRC_FLASH (0x%08lX vs 0x%08lX)\r\n",
+                       (unsigned long)crc_final, (unsigned long)crc_flash);
+                fail = 1;
+            }
+
+            if (fail) {
+                printf("[WIFI-OTA] [S8] !!! VERIFY FAIL. KEY0+Reset for Serial IAP rescue.\r\n");
+                state = BOOT_OTA_FAIL;
+                break;
+            }
+
+            /* 全过 → 写参数区记录本次新固件 size/crc 等信息，然后跳 APP */
+            printf("[WIFI-OTA] [S8] All 3 verify OK. Updating param area and JumpToApp...\r\n");
+            {
+                flash_param_t pm;
+                if (FlashParam_Load(&pm) == 0) {
+                    /* 参数区有效：基于现有结构，只改 fw 相关字段，保留其他（device_id/boot_count 等）*/
+                    pm.fw_size_bytes = g_info.fw_size;
+                    pm.fw_crc32     = g_info.fw_crc;
+                    pm.fw_build_num++;                     /* BUILD +1 */
+                    pm.ota_request_magic = 0xFFFFFFFFUL;   /* 清 OTA 请求标志，防重启循环 */
+                    pm.ota_new_fw_crc32  = 0xFFFFFFFFUL;   /* 清期望 CRC */
+                    pm.ota_new_fw_size   = 0xFFFFFFFFUL;   /* 清期望 size */
+                } else {
+                    /* 参数区无效：最小默认值，保护性写回 Flash */
+                    memset(&pm, 0xFF, sizeof(pm));
+                    pm.magic_header     = MAGIC_PARAM_HEADER;
+                    pm.fw_ver_major     = FW_VER_MAJOR;       /* 从 boot_ota.h 取 */
+                    pm.fw_ver_minor     = FW_VER_MINOR;
+                    pm.fw_ver_patch     = FW_VER_PATCH;
+                    pm.fw_build_num     = 1;
+                    pm.fw_size_bytes    = g_info.fw_size;
+                    pm.fw_crc32         = g_info.fw_crc;
+                    strncpy(pm.device_id, OTA_DEVICE_ID, sizeof(pm.device_id) - 1);
+                }
+                FlashParam_Save(&pm);
+            }
+
+            /* 跳 APP（D8 经验：跳转前要关全局中断 + 栈指针合法性校验）*/
+            printf("[WIFI-OTA] [S8] JumpToApp 0x%08lX ...\r\n", (unsigned long)APP_FLASH_START);
+            JumpToApp();
+            /* JumpToApp 成功时不会返回；一旦返回说明跳转失败（APP 头部栈值不合法）*/
+            printf("[WIFI-OTA] [S8] !!! JumpToApp returned (APP invalid?)\r\n");
+            state = BOOT_OTA_FAIL;
+            break;
+        }
+
+        /* ============================================================
+         *   态 9：FAIL 锁死，任一步失败后进入死循环
+         *   这里不再尝试自动跳 APP（APP 可能刷砖了）
+         *   用户只能 KEY0+Reset 进分支 2 的串口 IAP 救砖
+         * ============================================================ */
+        case BOOT_OTA_FAIL:
+            printf("[WIFI-OTA] !!! FAIL state. Press KEY0+Reset for Serial IAP rescue.\r\n");
+            for (;;) {
+                HAL_Delay(500);   /* 死循环锁住当前状态 */
+            }
+
+        case BOOT_OTA_IDLE:
+        default:
+            state = BOOT_OTA_FAIL;
+            break;
+        }
+
+        HAL_Delay(10);   /* 让出 CPU 总线，避免 UART 轮询太快造成接收丢字节；也给中断足够时间 */
+    }
+}
