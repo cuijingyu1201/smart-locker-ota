@@ -1,6 +1,7 @@
 // mainwindow.cpp - Main window class implementation (4 tabs)
 #include "mainwindow.h"
 #include "sensortab.h"
+#include "mqttconsoletab.h"
 #include <QWidget>
 #include <QLabel>
 #include <QVBoxLayout>
@@ -22,16 +23,9 @@ MainWindow::MainWindow(QWidget *parent)
         m_tabs->addTab(page, "Sensor Monitor");
     }
 
-    // ---- Tab 2: MQTT Console (D15 will implement) ----
+    // ---- Tab 2: MQTT Console (D15) ----
     {
-        QWidget *page = new QWidget(this);
-        QVBoxLayout *lay = new QVBoxLayout(page);
-        QLabel *lbl = new QLabel(
-            "Tab 2: MQTT Console\n"
-            "D15 will implement: JSON input box + send button + colored log",
-            page);
-        lbl->setAlignment(Qt::AlignCenter);
-        lay->addWidget(lbl);
+        MqttConsoleTab *page = new MqttConsoleTab(this);
         m_tabs->addTab(page, "MQTT Console");
     }
 
