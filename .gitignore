@@ -33,6 +33,7 @@ ReleaseConfig/
 *.user
 *.pro.user
 build-*/
+bin/
 
 .idea/
 traework_dialog_full.txt

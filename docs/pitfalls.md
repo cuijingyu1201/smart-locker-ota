@@ -1575,3 +1575,1047 @@ D13：OTA 容错测试与安全加固（CRC32 失败不写 flag + 擦除后读�
 
 
 
+D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-08-28）
+阶段归属：阶段4 上位机+PID · Qt6 上位机开发
+
+***
+
+## 坑1：qrand() / qsrand() 在 Qt6 中已被删除 - Qt5→Qt6 API 迁移坑
+
+* **现象**：Sensortab.cpp 编译报错：
+
+  ```
+  'qrand' was not declared in this scope; did you mean 'srand'?
+  ```
+
+* **根因**：Qt 5 提供 `qrand()` 和 `qsrand()` 作为随机数接口，但 Qt 6 已经彻底删除了这两个函数，因为 C++ 标准库 `<cstdlib>` 的 `rand()` / `srand()` 已经足够。项目文档（链接）里写的是"Qt 6.5 MinGW"，实际安装了 Qt 6.11.2，版本更老的代码示例还在用 qrand()。
+
+  | 对比  | Qt 5           | Qt 6                                      |
+  | --- | -------------- | ----------------------------------------- |
+  | 随机数 | `qrand()`      | 已删除 → 用 `rand()`                          |
+  | 种子  | `qsrand(seed)` | 已删除 → 用 `srand(seed)`                     |
+  | 头文件 | 不需要额外 include  | `#include <cstdlib>` + `#include <ctime>` |
+
+* **排查过程**：
+
+  1. 编译报 `qrand was not declared`，定位到 sensortab.cpp:36
+  2. 确认 Qt 版本 → 6.11.2
+  3. 查 Qt 6 文档 → qrand() 已删除，改用 C++ 标准库
+  4. 同时发现种子初始化也需要从 `qsrand(time(0))` 改成 `srand(time(nullptr))`
+
+* **解决**：三处修改：
+
+  ```cpp
+  // 1. 文件顶部加 include
+  #include <cstdlib>      // rand() / srand()
+  #include <ctime>        // time()
+
+  // 2. 构造函数里加种子初始化（只调用一次，不要在 onTimer 里调）
+  SensorTab::SensorTab(QWidget *parent)
+      : QWidget(parent)
+  {
+      srand(time(nullptr));   // 随机种子，放在构造函数里只跑一次
+      // ...
+  }
+
+  // 3. onTimer() 里 qrand() 全改成 rand()
+  m_curTemp = 25.0 + 3.0 * qSin(m_simPhase) + (rand() % 100) / 50.0;
+  m_curHumi = 60.0 + 8.0 * qSin(m_simPhase + 0.5) + (rand() % 100) / 30.0;
+  ```
+
+* **教训**：Qt 5→Qt6 迁移有一批 API 被删除/重命名，**写 Qt 代码前先确认当前版本**。文档里写 Qt 6.5 但实际装了 6.11.2（版本号越高越新），API 删除可能更多。如果从网上或旧文档抄代码，遇到 "was not declared" 错误，**先查 Qt 版本**，大概率是 API 变更。常见 Qt5→Qt6 变更清单：
+
+  * `qrand()` → 删除，用 `rand()`
+
+  * `qSort()` → 改为 `std::sort()`
+
+  * `QTextCodec` → 删除，用 `QString::fromUtf8()` 等
+
+  * `QRegExp` → 建议改用 `QRegularExpression`
+
+***
+
+
+## D14 成果
+
+* **Qt6 环境搭建完成**：Qt 6.11.2 MinGW + Qt Creator，安装包配置正确，核心模块（core/gui/widgets/network）全部就绪。SerialPort 模块暂未安装，D16 做串口 IAP Tab 时补装。
+
+* **pc\_tool 工程骨架（4 Tab 切换）**：
+
+  * `IotOtaTool.pro`：qmake 工程配置，4 个源文件 + 4 个头文件，编译输出到 `bin/`
+
+  * `main.cpp`：程序入口，创建 QApplication 和 MainWindow
+
+  * `mainwindow.h/cpp`：主窗口类，QTabWidget 容器 + 4 个 Tab
+
+* **Sensor Monitor Tab（QPainter 纯手绘实时曲线）**：
+
+  * `sensortab.h/cpp`：独立 SensorTab 类
+
+  * 顶部大数字区：温度（红）+ 湿度（蓝）+ 固件版本 + Online 状态
+
+  * 中间双图表：温度曲线（15~~35°C，红色线+浅红填充）+ 湿度曲线（30~~90%RH，蓝色线+浅蓝填充）
+
+  * 环形缓冲 100 点：`m_temp[100]` / `m_humi[100]` + `m_writeIdx` / `m_count` 实现固定窗口滑动
+
+  * QTimer 500ms 定时触发 `onTimer()` → 模拟数据生成 → `update()` 请求重绘 → `paintEvent` 执行
+
+  * `valueToY()` 辅助函数处理 Y 轴反转 + 越界保护
+
+  * `QPainterPath` + `Antialiasing` 实现平滑曲线 + 面积填充
+
+  * `resizeEvent` 窗口缩放自动重绘
+
+* **Qt 新手 7 个坑全部踩过**：从 vtable 链接错误到 qrand() 被删、从 Configure Project 页面看不懂到坐标反转，每个坑都有明确的根因和解决方案，D15-D18 开发可以直接参考避坑。
+
+* **编译 0 Error 0 Warning**，Ctrl+R 运行正常，4 Tab 能切换，Sensor Monitor 曲线持续滚动。
+
+* **代码量**：新增约 400 行（sensortab.h 45 行 + sensortab.cpp 260 行 + mainwindow 改动约 10 行 + .pro 改动 2 行），全部 D14 独立代码，与 STM32 端无耦合（后续接真实 MQTT 数据只需改 onTimer 里的数据源）。
+
+* **工程文件清单**：
+
+  ```
+  d:\iot_ota_project\pc_tool\
+  ├── IotOtaTool.pro      ← 工程配置
+  ├── main.cpp            ← 入口
+  ├── mainwindow.h/cpp    ← 4 Tab 容器
+  ├── sensortab.h/cpp     ← 实时曲线（环形缓冲 + QPainter）
+  └── bin\                ← 编译输出
+  ```
+
+* **D15 预告**：补 MQTT 控制台 Tab（JSON 输入框 + 发送按钮 + 彩色日志）+ 把 SensorTab 的模拟数据换成真实 MQTT 订阅数据。需要安装 Qt MQTT 模块或用第三方库，当前 .pro 的 QT += network 已具备 TCP 基础。
+
+
+
+
+# D15 Pitfalls（Qt6上位机 MQTT 控制台 Tab）
+
+**日期**：2026-08-28
+**任务**：补 MQTT 控制台 Tab：JSON 输入框 + 发送按钮 + 彩色日志；手动实现 MQTT 3.1.1 协议（Qt 6.11.2 在线安装器无 MQTT 模块）
+**Checkpoint**：上位机 MQTT 和设备同连 broker.emqx.io，互相能看到对方发的消息
+
+***
+
+## 坑 1：hex 流操作符 Qt6 用法变化 → 'hex' was not declared
+
+* **现象**：mqttclient.cpp parseIncoming 里 `qDebug() << "MQTT: unhandled packet type" << hex << pktType` 报 `'hex' was not declared in this scope`
+
+* **根因**：Qt5 的 `QDebug` 会把 `std::hex` 之类的 iomanip 转进流里；Qt6 做了更严格的类型限制，必须显式用 Qt 自己的接口或 `QString::number`
+
+* **排查过程**：
+
+  1. 错误指向 `qdebug.h` 里面 → 说明不是 mqttclient 自己的问题
+  2. 回忆 sensortab.cpp 之前的 qrand 错误 → 又是 Qt5→Qt6 迁移问题
+  3. 其实 `hex` 本身在 `<iomanip>` 里有，但 qDebug 的 operator<< 不再接 std 流操作符
+
+* **解决**：两种办法：
+
+  1. 简单的：直接去掉 `<< hex`，只打印 pktType 数值
+  2. 需要十六进制显示的话用 `QString`：
+
+     ```cpp
+     qDebug() << "MQTT: unhandled packet type"
+              << QString("0x%1").arg(pktType, 0, 16);
+     ```
+
+* **教训**：Qt6 对 std 流操作符不再隐式兼容，调试输出里的 `hex`/`dec`/`endl` 全部要换掉或用 Qt 自己的格式函数
+
+***
+
+
+## 坑 2：QTcpSocket readyRead 时一次性读不全，误以为协议解析有问题
+
+* **现象**：收 PUBLISH 帧时，`readAll()` 只拿到了 4 字节（固定头+remlen+一半topic len），后面一半过几十毫秒才收到，parseIncoming 报"remlen=256 但 buffer 只有 50 字节" → 解析失败
+
+* **根因**：TCP 是"字节流"，不是"消息流"。一个 MQTT 帧可能被分 2\~3 个 TCP 包发过来，`readyRead` 可能触发多次，每次只带来一部分。如果你假设 readAll() 能拿到一个完整帧，就会把半条帧当完整的解析
+
+* **排查过程**：
+
+  1. 给 `readyRead` 打日志，发现同一个 MQTT 帧触发了 2 次 readyRead
+  2. 第一次 readAll() 了 40 字节，第二次 readAll() 了 120 字节
+  3. 两次加起来刚好是完整帧的 160 字节
+
+* **解决**：维护一个**持久化的接收缓冲区** **`m_rxBuffer`**，每次 readyRead 把 readAll() append 进去；parseIncoming() 从 m\_rxBuffer 开头尝试解析一个完整包；够就解，解完把消费掉的字节 remove 掉；不够就等下次 readyRead 再进来
+
+* **教训**：TCP 永远按"字节流"想，不要按"消息"想。D12 WiFi OTA 处理 AT+CIPRECVDATA 时也是同样的道理——必须有跨调用累积缓冲。同样的知识点从 STM32 ESP8266 移植到了 Qt QTcpSocket
+
+***
+
+
+## 坑 3：PUBLISH 帧 QoS0 多写了 Packet ID → Broker 认为帧格式错，连接被强制断开
+
+* **（易错）**
+
+* **现象**：PUBLISH 发出去后 Broker 立刻断连接（TCP FIN），状态变 Disconnected，没有任何错误日志
+
+* **根因**：MQTT PUBLISH 帧结构：
+
+  * QoS0：Topic + Payload，没有 Packet ID 字段
+
+  * QoS1：Topic + Packet ID（2 字节）+ Payload
+
+  * QoS2：Topic + Packet ID（2 字节）+ Payload + 额外流程
+
+  如果 QoS0 的帧里多塞了 2 字节 Packet ID，Broker 解析时会把那 2 字节当成 Payload 的一部分，然后 Remaining Length 就不匹配，认为是畸形包 → 按 MQTT 规范必须断连接且不回任何报文
+
+* **排查过程**：
+
+  1. QoS0 发布失败，QoS1 却成功 → 这是关键信号
+  2. 对比 buildPublishPacket 里 `if (qos > 0) add pktId` 的逻辑
+  3. 发现条件写成了 `if (qos >= 0)`，导致 QoS0 也加了 2 字节
+
+* **解决**：严格按标准，Packet ID 只在 QoS ≥ 1 时存在
+
+* **教训**：手写协议帧时，每个条件分支用表格对照。PUBLISH 是 MQTT 里最复杂的可变帧，QoS 位和 DUP/RETAIN 位的组合有 8 种，每种帧结构都可能不同
+
+***
+
+## 坑 4：MQTT 变长 Remaining Length 编解码漏了 continuation bit → 大 payload 解析错位
+
+* **（易错，实现 MqttClient 时必须搞对）**
+
+* **现象**：小消息（<127 字节）收发正常，大 JSON（>128 字节）发出去 Broker 不认，或者收到的消息被截断，payload 前面少了 1 字节，后面多了 1 字节的乱码
+
+* **根因**：MQTT 第 2 字节开始是 "Remaining Length"，采用**变长编码**：
+
+  * 0\~127：1 字节，值直接写
+
+  * 128\~16383：2 字节，**第一个字节最高位必须置 1**（continuation bit），表示"后面还有字节"
+
+  * 16384 以上：3\~4 字节，同样前 N-1 个字节最高位都要 |=0x80
+
+  忘了置 continuation bit（比如 128 直接写成 0x80 不带后续字节，或者写 0x01 0x00 不带 continuation bit），Broker 会把后续字节当成 payload 的一部分，导致整个帧解析错位
+
+* **排查过程**：
+
+  1. 短消息正常，长消息异常 → 长度相关问题
+  2. 抓包看第二字节：payload 150 字节 → remlen 应该是 `0x96 0x01`（150 = 0x16，最高位+1=0x96，下一字节是 1）
+  3. 如果发出去是 `0x16 0x01`，那就是没加 continuation bit
+
+* **解决**：encodeRemLen 里一定要有 `if (len > 0) digit |= 0x80;`，decodeRemLen 里一定要有 `while ((byte & 0x80) != 0)` 直到 continuation bit = 0
+
+* **教训**：MQTT 协议最容易写错的就是 Remaining Length 的编解码。测试时一定要覆盖三种长度：<127（1字节）、128\~16383（2字节）、>16384（3字节）。D15 发的 JSON 都 <64 字节，这个坑在后面做大 payload（OTA 信息包）时一定会冒出来
+
+***
+
+## D15 成果总结
+
+* MqttClient 类：纯 QTcpSocket 手写 MQTT 3.1.1 协议（CONNECT/SUBSCRIBE/PUBLISH/PINGREQ/PUBACK 5 种帧 + 变长 Remaining Length 编解码 + 流式接收入口环形缓存）
+
+* MQTT Console Tab：Broker 连接区 + 订阅区 + JSON 发布区 + 分颜色彩色日志（sensor 蓝 / ota 紫 / 发绿 / 出错红）
+
+* Checkpoint 达成：Qt 上位机 <-> MQTTX 模拟器 <-> broker.emqx.io 三方互发互收，主题/时间戳完全对齐
+
+
+
+
+# D16 Pitfalls（代码稳定性加固：9 个偶发 / 致命 Bug 修复）
+
+**日期**：2026-09-02
+**任务**：对 app 和 bootloader 两个工程做稳定性审计，识别并修复会导致系统崩溃 / 卡死 / 变砖的偶发与致命 bug
+**Checkpoint**：9 个 bug 全部修复，编译 0 Error 0 Warning，硬件实测无 HardFault / 卡死 / 变砖
+
+***
+
+## 坑 1：ESP8266 接收缓冲区 ISR 与任务竞态（数据撕裂 / 半新半旧）
+
+* **现象**：ESP8266 在 `TaskESP8266` 状态机里调用 `ESP8266_GetLine()` 取一行数据时，偶尔读到"半新半旧"的字节流——前半段是上一条 AT 响应的尾巴，后半段是当前响应的开头。串口日志表现为 JSON 解析失败、AT 命令重发、状态机误跳。压测几分钟后偶发 MQTT 掉线，Reset 后正常，复现概率低。
+
+* **根因**：`ESP8266_GetLine()` 和 `ESP8266_ClearRxBuf()` 操作的是同一个 `esp_rx_buf[512]` 数组和写指针 `esp_rx_wr_idx`，而这两个变量**同时被两个上下文访问**：
+
+  * **写者**：USART2 接收完成中断 `HAL_UART_RxCpltCallback`（ISR 上下文），每收到 1 字节就执行 `esp_rx_buf[esp_rx_wr_idx++] = ch;`
+
+  * **读者**：`TaskESP8266`（任务上下文），调用 `ESP8266_GetLine()` 时执行 `memcpy(line, esp_rx_buf, esp_rx_wr_idx); esp_rx_wr_idx = 0;`
+
+  ISR 是**不可屏蔽**的（CubeMX 配 USART2 优先级 5），任务读 `memcpy` 过程中 ISR 随时可能插入并改写 `esp_rx_buf` 和 `esp_rx_wr_idx`：
+
+  * 任务刚读完 `esp_rx_wr_idx` 准备 `memcpy` → ISR 进来把新字节写到 `esp_rx_buf[esp_rx_wr_idx]` 并把 `esp_rx_wr_idx++` → 任务用"旧长度"复制"新内容" → 拷出来的字节流前后对不上。
+
+  * 更严重的是 `esp_rx_wr_idx = 0` 这一行：任务刚清零，ISR 立刻写入 `esp_rx_buf[0]` 并把 `esp_rx_wr_idx` 置 1，但任务这边以为缓冲是空的，下次取到的就是这条 ISR 写的"孤儿字节"。
+
+* **排查过程**：
+
+  1. 串口日志看到 `ParsePublish` 报 `first_byte=0x0D`（CR），怀疑 ESP8266 回显混进了 MQTT 帧。
+  2. 在 `ESP8266_GetLine` 入口加 `uart_printf_mutex("[GETLINE] wr_idx=%d\r\n", esp_rx_wr_idx);` → 发现偶发 `wr_idx` 在 `memcpy` 过程中变了（打印出来的值和实际拷出的长度对不上）。
+  3. 复盘代码：`esp_rx_buf` / `esp_rx_wr_idx` 是裸全局变量，**没有任何互斥保护**，ISR 和任务并发改 → 经典竞态。
+  4. 进一步确认：STM32F1 的 `memcpy` 不是单条原子指令，Cortex-M3 的 `LDR/STR` 虽然不总线交错，但 `memcpy` 内部循环里多次访问内存，ISR 随时打断它都会导致"读到中间状态"。
+
+* **解决**：在 `ESP8266_GetLine()` 和 `ESP8266_ClearRxBuf()` 里用 FreeRTOS 的 `taskENTER_CRITICAL()` / `taskEXIT_CRITICAL()` 包住缓冲区操作：
+
+  ```c
+  /* app/Src/usart.c */
+  uint16_t ESP8266_GetLine(char *line, uint16_t max_len)
+  {
+      uint16_t len;
+      taskENTER_CRITICAL();                              /* 关中断，防止 ISR 竞态 */
+      {
+          if (esp_rx_wr_idx == 0) {                      /* 空，什么都没收到 */
+              taskEXIT_CRITICAL();
+              return 0;
+          }
+          if (esp_rx_wr_idx >= max_len) esp_rx_wr_idx = max_len - 1;  /* 超长截断 */
+          memcpy(line, esp_rx_buf, esp_rx_wr_idx);
+          line[esp_rx_wr_idx] = '\0';
+          len = esp_rx_wr_idx;
+          esp_rx_wr_idx = 0;                             /* 清空缓冲，准备下一行 */
+      }
+      taskEXIT_CRITICAL();                               /* 开中断 */
+      return len;
+  }
+
+  void ESP8266_ClearRxBuf(void)
+  {
+      taskENTER_CRITICAL();
+      esp_rx_wr_idx = 0;
+      memset(esp_rx_buf, 0, ESP_RX_BUF_SIZE);
+      taskEXIT_CRITICAL();
+  }
+  ```
+
+  `taskENTER_CRITICAL()` 在 Cortex-M3 上等价于 `__set_BASEPRI(ucMaxPriorityValue)`，把所有优先级数字 ≥ configMAX\_SYSCALL\_INTERRUPT\_PRIORITY 的中断都屏蔽，ISR 进不来，`memcpy` 和清零操作变成原子区。退出后 ISR 立刻能进。
+
+* **教训**：**任何被 ISR 和任务同时访问的共享变量（缓冲区、索引、链表头）都必须用临界区或互斥锁保护**。判断方法：全局问一句"这个变量除了任务，ISR 里有没有改？" → 有就必须加临界区。临界区要尽量短（只包缓冲区操作，不包 printf / osDelay / Flash 写入），否则把所有中断都关了会影响实时性。Cortex-M3 临界区里**绝对不能调任何 FreeRTOS API 不带 FromISR 后缀的版本**，也不能调 `osDelay`。
+
+***
+
+## 坑 2：互斥锁获取失败后仍调用 Release（FreeRTOS 内核状态错乱）
+
+* **现象**：`TaskDHT11` 偶发卡死后看门狗复位，复位前最后一次串口日志是 `[DHT11] temp=25C`，下一次启动后 `osMutexRelease` 偶尔返回 `osErrorResource`。压测 30 分钟以上必现。
+
+* **根因**：原代码模式是"先 acquire，再做事，最后 release"，但 acquire 用了带超时的调用且没检查返回值：
+
+  ```c
+  /* 修改前（错误模式） */
+  if (g_dht11_mutex_handle != NULL) {
+      osMutexAcquire(g_dht11_mutex_handle, 100);   /* ← 返回值没检查 */
+  }
+  local = g_dht11_data;
+  if (g_dht11_mutex_handle != NULL) {
+      osMutexRelease(g_dht11_mutex_handle);         /* ← 即使没 acquire 成功也会调 */
+  }
+  ```
+
+  如果 `osMutexAcquire(timeout=100)` 在 100ms 内没拿到锁（比如锁被 `TaskESP8266` 长期持有，或者持有者任务被挂起），返回 `osErrorTimeout` 或 `osErrorResource`。此时**当前任务并没有持有这把锁**，但后面照样 `osMutexRelease` → 释放一把不属于自己的锁 → FreeRTOS 内核的 mutex owner 指针错配 → 调度器内部状态机错乱 → 后续所有 `osMutexAcquire/Release` 行为不可预测 → 最终 HardFault。
+
+  CMSIS-RTOS V2 的 `osMutexAcquire` 在超时返回时**不会修改内核的 mutex holder**，但对同一个 mutex 多次不对称 release 会让内核的 recursion counter 和 owner 指针对不上。
+
+* **排查过程**：
+
+  1. DHT11 任务偶发卡死，加 `uxTaskGetStackHighWaterMark` 打印 → 栈剩余 80+ words，不是栈溢出。
+  2. 复位前最后一次日志是 DHT11，怀疑 DHT11 任务里的锁。
+  3. 读代码发现 `osMutexAcquire` 的返回值没检查 → 失败也会 release。
+  4. 用 `osMutexGetOwner(g_dht11_mutex_handle)` 打印 owner → 偶发 owner 不是 DHT11 任务也不是 ESP8266 任务（说明内核状态已经错乱了）。
+
+* **解决**：把 acquire 的返回值检查放在同一个 `if` 条件里，只有 `== osOK` 才允许 release；超时走 else 分支（直接读全局变量，最多读到半新半旧，不致命）：
+
+  ```c
+  /* app/Src/app_dht11.c */
+  if (g_dht11_mutex_handle != NULL &&
+      osMutexAcquire(g_dht11_mutex_handle, 100) == osOK) {
+      g_dht11_data = local;
+      osMutexRelease(g_dht11_mutex_handle);
+  } else {
+      g_dht11_data = local;   /* 锁超时也写，最多丢一次一致性 */
+  }
+  ```
+
+  `app_esp8266.c` 里读 `g_dht11_data` 的地方同步改成相同的模式：
+
+  ```c
+  /* app/Src/app_esp8266.c MQTT_PublishSensor() */
+  if (g_dht11_mutex_handle != NULL &&
+      osMutexAcquire(g_dht11_mutex_handle, 100) == osOK) {
+      local = g_dht11_data;
+      osMutexRelease(g_dht11_mutex_handle);
+  } else {
+      local = g_dht11_data;   /* 锁超时也读，最多读到半新半旧 */
+  }
+  ```
+
+* **效果**：互斥锁的 acquire/release 永远成对出现，不会出现"未持有就释放"的非法状态。DHT11 任务压测 1 小时不再卡死。
+
+* **教训**：**`osMutexAcquire(timeout)`** **的返回值必须检查**。嵌入式代码里凡是"先 acquire 再 release"的模式，一定要写成 `if (acquire == osOK) { ... release }` 的对称结构。超时分支要有降级路径（读全局变量这种"最多一次不一致"的操作），不能直接 return 不做事——那样会让上层逻辑卡死在等数据。判别特征：偶发 HardFault 且复位前最后一个动作是 `osMutexRelease`，优先怀疑 acquire 失败但仍 release。
+
+***
+
+## 坑 3：printf 用 HAL\_MAX\_DELAY 导致全系统死锁（一个 TX 故障拖垮所有任务）
+
+* **现象**：系统跑了一段时间后所有任务同时停止——LED 不闪、串口不打印、MQTT 不上报、按键无反应。复位后正常，复现周期不固定。
+
+* **根因**：`uart_printf_mutex()` 里用 `HAL_UART_Transmit(..., 0xFFFF)` 等待发送完成，超时参数 `0xFFFF` 在 HAL 里实际是"无限等待"语义：
+
+  ```c
+  /* 修改前（致命） */
+  (void)HAL_UART_Transmit(&huart1, (uint8_t *)g_uart_log_buffer,
+                          (uint16_t)len, 0xFFFF);   /* ← 永不超时 */
+  ```
+
+  `HAL_UART_Transmit` 内部是"等 TXE 标志 → 写 DR → 等 TC 标志"的轮询循环，只要 USART 外设的 TXE 标志不置位（USART 时钟被关掉、TX 引脚 GPIO 被改用、外设硬件故障、DMA 被别的任务抢走），这个循环就**永不返回**。
+
+  更致命的是上层调用结构：
+
+  ```
+  TaskA 调 uart_printf_mutex → osMutexAcquire 拿到锁 → HAL_UART_Transmit 死等
+  TaskB 调 uart_printf_mutex → osMutexAcquire(100ms 超时) → 100ms 后返回 osErrorTimeout
+  TaskC 调 uart_printf_mutex → 同样超时
+  ...
+  ```
+
+  TaskA 永久占着 UART 互斥锁，其他所有任务想打印日志全部 100ms 后失败返回（看 `osMutexAcquire` 返回值没检查时还会触发坑 2 的连锁问题）。**任何任务里一旦调了 printf，100ms 内就会被这个锁拖死**，整片 RTOS 就瘫了。看门狗喂狗任务（如果优先级低）也会被拖死 → IWDG 复位 → 但 Reset 后又正常 → 难以复现。
+
+* **排查过程**：
+
+  1. 所有任务同时不动了，先怀疑调度器 → `uxTaskGetSystemState` 打印所有任务状态 → TaskA 在 `Blocked` 但不是等信号量，是等 `HAL_UART_Transmit` 返回。
+  2. 单步 `HAL_UART_Transmit` → 卡在 `while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TXE) == RESET)`。
+  3. 看上层 `uart_printf_mutex` → 用的 `0xFFFF` 永不超时。
+  4. 复盘 USART1 硬件状态 → TXE 不置位通常是因为 TX 引脚被外部强拉低（短路）或者 USART 时钟被关。
+
+* **解决**：把超时从 `0xFFFF` 改成有限值，给 TX 故障留逃生通道：
+
+  ```c
+  /* app/Src/app_uart.c */
+  (void)HAL_UART_Transmit(&huart1, (uint8_t *)g_uart_log_buffer,
+                          (uint16_t)len, 100U);  /* 100ms 超时，防 TX 故障死锁 */
+  ```
+
+  100ms 在 115200 波特率下足够发完 256 字节缓冲（实际耗时约 22ms），正常打印完全不受影响；TX 真出问题时 100ms 后返回，互斥锁被释放，其他任务还能继续跑。
+
+* **效果**：即使 USART1 硬件故障，单次 `uart_printf_mutex` 最多卡 100ms，不会拖死所有任务。
+
+* **教训**：**嵌入式里凡是带"等待"语义的函数，超时参数绝不能用** **`HAL_MAX_DELAY`** **/** **`0xFFFF`** **/** **`osWaitForever`**，必须用有限时间。`HAL_MAX_DELAY` 看着方便，本质是把"硬件故障"这种"可恢复异常"变成"系统死锁"这种"不可恢复故障"。判别特征：所有任务同时卡死且没有 HardFault，优先查是不是有外设操作用了无限超时。`HAL_UART_Transmit` / `HAL_I2C_Master_Transmit` / `HAL_SPI_Transmit` / `HAL_FLASH_Program` 这类函数都要加超时上限。
+
+***
+
+## 坑 4：Bootloader 跳转前无 CRC + 地址校验（半块固件跳转变砖）
+
+* **现象**：OTA 升级中断电（S6 写到一半拔电源）后重新上电，Bootloader 打印 `APP valid` 就直接跳 APP，跳进去后 APP 只写了前 2KB、后面 31KB 是 0xFF，APP 跑飞或 HardFault，板子变砖。
+
+* **根因**：
+
+  **根因 1（栈指针判据太弱）**：`IsAppValid()` 只检查 0x08008000 处栈指针的高 12 位是否等于 0x200（合法 RAM 地址）：
+
+  ```c
+  /* 修改前（判据不足） */
+  uint8_t IsAppValid(void) {
+      uint32_t app_sp = *(volatile uint32_t *)APP_FLASH_START;
+      if ((app_sp & 0xFFF00000) == 0x20000000) {  /* 只看高12位 */
+          return 1;
+      }
+      return 0;
+  }
+  ```
+
+  OTA 中断电时，S6 写了 seq=0（头 1024 字节）就把新固件的栈指针写到 0x08008000 了，这个值是合法的 0x2000xxxx → `IsAppValid()` 返回 true → Bootloader 以为 APP"有效"→ 跳转 → 但 APP 后面 31KB 还是 0xFF → HardFault。
+
+  **根因 2（JumpToApp 没有地址校验）**：原 `JumpToApp()` 读 `app_sp` 和 `app_reset` 就直接跳，没有检查 reset 地址是否落在 APP Flash 区间内，也没有检查 Thumb 位：
+
+  ```c
+  /* 修改前（无地址校验） */
+  void JumpToApp(void) {
+      uint32_t app_sp = *(volatile uint32_t *)APP_FLASH_START;
+      uint32_t app_reset = *(volatile uint32_t *)(APP_FLASH_START + 4);
+      /* ← 没有任何合法性检查 */
+      pFunc jump = (pFunc)app_reset;
+      __set_MSP(app_sp);
+      jump();
+  }
+  ```
+
+  如果 Flash 被写坏（0x08008004 处是 0xFFFFFFFF），`app_reset = 0xFFFFFFFF` → 跳到 0xFFFFFFFF → 总线 fault → 变砖。SysTick 中断如果还在挂起，跳过去立刻触发异常。
+
+* **排查过程**：
+
+  1. OTA 中断电后复现 → Bootloader 日志显示 `APP valid` 直接跳 → 但 APP 跑飞。
+  2. 读 `IsAppValid` → 只看栈指针高 12 位，判据不够。
+  3. 读 `JumpToApp` → 没检查 reset 地址合法性，也没关 SysTick。
+  4. 对比 D12 的 `last_ota_result` 标志：升级中断电时 Bootloader 写 `last_ota_result=4`，但 main.c 启动检查是 `if (last_ota_result==4)` 走 IAP 救砖 → 这条路其实是对的，但 `IsAppValid()` 走在前面，`last_ota_result` 还没查就跳了。
+
+* **解决**：
+
+  **修复 1（main.c 加 CRC 门禁）**：在 `IsAppValid()` 通过之后、`JumpToApp()` 之前再加一层 CRC 校验，读参数区的 `fw_size_bytes` 和 `fw_crc32`，对 Flash 实际内容算 CRC32 比对：
+
+  ```c
+  /* bootloader/Core/Src/main.c */
+  else if (IsAppValid())
+  {
+      printf("[BOOT] APP SP valid, checking CRC...\r\n");
+
+      /* === CRC 门禁：防止半写固件跳转变砖 === */
+      int crc_ok = 0;
+      if (FlashParam_Load(&g_param_buf) == 0 &&
+          g_param_buf.fw_size_bytes != 0xFFFFFFFFUL &&
+          g_param_buf.fw_size_bytes <= APP_FLASH_SIZE)
+      {
+          uint32_t crc_now = CRC32_Calc((const uint8_t *)APP_FLASH_START,
+                                         g_param_buf.fw_size_bytes);
+          if (crc_now == g_param_buf.fw_crc32) {
+              crc_ok = 1;
+              printf("[BOOT] CRC OK (0x%08lX), fw_size=%lu\r\n",
+                     (unsigned long)crc_now, (unsigned long)g_param_buf.fw_size_bytes);
+          } else {
+              printf("[BOOT] CRC FAIL! flash=0x%08lX param=0x%08lX\r\n",
+                     (unsigned long)crc_now, (unsigned long)g_param_buf.fw_crc32);
+          }
+      }
+      else
+      {
+          /* 参数区未初始化（首次烧录），放行 */
+          crc_ok = 1;
+          printf("[BOOT] Param uninitialized, skip CRC (first boot)\r\n");
+      }
+
+      if (crc_ok) {
+          JumpToApp();
+      } else {
+          (void)IAP_ProcessSerial();   /* CRC 失败 → 进串口 IAP 救砖 */
+          while (1) { BOOT_KICK_DOG(); HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin); HAL_Delay(500); }
+      }
+  }
+  ```
+
+  **修复 2（jump\_to\_app.c 加地址 + SysTick 校验）**：跳转前检查 SP 范围、reset 地址范围、Thumb 位，关掉 SysTick 防止跳过去后残留中断触发：
+
+  ```c
+  /* bootloader/Core/Src/jump_to_app.c */
+  void JumpToApp(void)
+  {
+      uint32_t app_sp    = *(volatile uint32_t *)APP_FLASH_START;
+      uint32_t app_reset = *(volatile uint32_t *)(APP_FLASH_START + 4);
+
+      /* 2b. 校验地址合法性（防止跳转到 0xFFFFFFFF 变砖）*/
+      if (app_sp < 0x20000000UL || app_sp > 0x20010000UL) return;       /* SP 必须在 RAM */
+      if (app_reset < APP_FLASH_START || app_reset >= APP_FLASH_END) return;  /* reset 必须在 APP Flash */
+      if ((app_reset & 1U) == 0U) return;   /* Thumb 函数地址最低位必须为 1 */
+
+      pFunc jump = (pFunc)app_reset;
+
+      /* 3. 关中断 */
+      __disable_irq();
+
+      /* 3b. 停止 SysTick（防止跳转后 SysTick 中断残留触发异常）*/
+      SysTick->CTRL = 0;
+      SysTick->LOAD = 0;
+      SysTick->VAL = 0;
+      SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk;   /* 清除 SysTick 挂起标志 */
+
+      /* 4. 清除所有 NVIC 挂起标志 */
+      for (int i = 0; i < 8; i++) {
+          NVIC->ICER[i] = 0xFFFFFFFF;
+          NVIC->ICPR[i] = 0xFFFFFFFF;
+      }
+
+      /* 5. VTOR 指向 APP 向量表 */
+      SCB->VTOR = APP_FLASH_START;
+
+      /* 6. 设 MSP 并跳转 */
+      __set_MSP(app_sp);
+      jump();
+  }
+  ```
+
+* **效果**：
+
+  * 即使新固件只写了 seq=0，参数区里 `fw_crc32` 和 Flash 实际 CRC 对不上 → CRC 失败 → 进 IAP 救砖，不会跳半块 APP。
+
+  * 即使 Flash 被写坏成 0xFFFFFFFF，`app_reset` 校验失败 → 直接 return → 进入 IAP 救砖，不会跳 0xFFFFFFFF 变砖。
+
+  * SysTick 残留中断被清掉，APP 启动不会立刻 HardFault。
+
+* **教训**：**栈指针合法 ≠ 固件完整**。`IsAppValid()` 这种"看栈指针"的判据只能判断"APP 烧没烧过"，不能判断"APP 烧完没"。任何 OTA / 远程升级场景必须配合独立的完整性校验（CRC32 / 签名）+ 升级状态标志（`last_ota_result`）三重判据。跳转函数本身必须做地址范围检查，不能信任 Flash 里的任何值——Flash 可能被写坏、被擦了一半、被异常电压翻转。**SysTick 在 Bootloader 用了，跳 APP 前必须停掉**，否则 APP 启动时 SysTick 中断还在挂起，向量表还没切过去就触发 default handler → HardFault。判别特征：OTA 中断电后 Reset 直接跳 APP 跑飞，优先查 Bootloader 是不是只有"栈指针合法"这一道门禁。
+
+***
+
+## 坑 5：MQTT 解析 NULL 解引用 + 越界（外部数据导致 HardFault）
+
+* **现象**：ESP8266 偶尔发来一个长度异常或内容异常的报文（比如 TCP 断连前残留的 4 字节），`MQTT_ParsePublish` 立刻 HardFault，串口不再打印，板子复位。
+
+* **根因**：原 `MQTT_IsConnackSuccess` / `MQTT_FindPublishFrame` / `MQTT_ParsePublish` 这三个函数**在解引用 data 指针之前没有做 NULL 检查**，也没有对 remaining\_len / topic\_len 做边界校验：
+
+  ```c
+  /* 修改前（致命） */
+  int MQTT_ParsePublish(const uint8_t *data, int mqtt_len, ...)
+  {
+      int remaining_len;
+      int topic_len;
+      int offset;
+
+      /* ← 没有 NULL 检查，直接解引用 */
+      if ((data[0] & 0xF0) != 0x30)      return -2;
+
+      remaining_len = data[1];   /* ← 声称的剩余长度，没校验 */
+      if (remaining_len < 4) return -3;
+
+      topic_len = (data[2] << 8) | data[3];   /* ← 声称的主题长度，没校验 */
+      /* ← remaining_len 比 mqtt_len 大时直接越界读 */
+      offset = 4;
+      *topic_out = (const char *)&data[offset];   /* ← 越界指针 */
+      ...
+  }
+  ```
+
+  三个致命点：
+
+  1. `data == NULL` 时第一行 `data[0]` 直接 HardFault（非法地址访问）。
+  2. `remaining_len` 是对方声称的长度，没和实际 `mqtt_len` 对比，声称 200 字节实际只有 10 字节 → 后续 memcpy / 指针解引用越界。
+  3. `topic_len` 同样是对方声称的，没和 `remaining_len` 对比 → 越界。
+
+  MQTT 报文来自 ESP8266 TCP 流，**等于完全不可信的外部输入**，任何字段都可能被恶意或异常构造。
+
+* **排查过程**：
+
+  1. 偶发 HardFault，复位前最后一次日志是 `[DEBUG] ParsePublish: len=4`。
+  2. 复位后单步 → `data[0]` 解引用时 HardFault，但这次 data 不是 NULL → 怀疑是越界访问。
+  3. 读代码发现 NULL 检查在解引用之后，且 remaining\_len / topic\_len 没有边界校验。
+  4. 复盘：TCP 断连前 ESP8266 推过来 4 字节残留（`0x30 0x02 0xFF 0xFF`），`topic_len = 0xFFFF` → 越界访问 0x0800xxxx 之后 64KB → 访问未映射的内存 → HardFault。
+
+* **解决**：所有解析函数严格按"先检查参数合法性，再访问数据"的顺序，每一步都做边界验证：
+
+  ```c
+  /* app/Src/mqtt_client.c */
+  int MQTT_IsConnackSuccess(const uint8_t *data, int len)
+  {
+      int i;
+      if (data == NULL || len < 4) {   /* ← NULL 和最小长度检查在解引用之前 */
+          return 0;
+      }
+      /* 后续才能安全访问 data[i] */
+      for (i = 0; i <= (len - 4); i++) { ... }
+  }
+
+  int MQTT_FindPublishFrame(const uint8_t *data, int len)
+  {
+      int i;
+      if (data == NULL || len < 4) return -1;   /* ← NULL 检查先行 */
+      for (i = 0; i < len; i++) { ... }
+  }
+
+  int MQTT_ParsePublish(const uint8_t *data, int mqtt_len, ...)
+  {
+      int remaining_len;
+      int topic_len;
+      int offset;
+
+      /* 1. 入参合法性检查（必须在任何 data 解引用之前）*/
+      if (data == NULL || mqtt_len < 4) return -1;
+      if ((data[0] & 0xF0) != 0x30)      return -2;   /* 不是 PUBLISH 帧头 */
+
+      /* 2. 读剩余长度，校验声称长度不超过实际数据 */
+      remaining_len = data[1];
+      if (remaining_len < 4) return -3;                /* 至少 2+2=4 字节 */
+      if (remaining_len > (mqtt_len - 2)) return -6;    /* 声称长度不能超过实际数据 */
+
+      /* 3. 读主题长度，校验不超过 remaining_len */
+      topic_len = (data[2] << 8) | data[3];
+      if (topic_len <= 0 || topic_len > (remaining_len - 2)) return -4;
+      if ((4 + topic_len) > mqtt_len) return -7;        /* 主题必须在缓冲区内 */
+
+      /* 4. 设置 topic 和 payload 输出指针 */
+      offset = 4;
+      *topic_out = (const char *)&data[offset];
+      *topic_len_out = topic_len;
+
+      offset += topic_len;
+      *payload_len_out = remaining_len - 2 - topic_len;
+      if (*payload_len_out < 0) return -5;
+      /* 钳位：payload 长度不能超出实际可用数据 */
+      if ((4 + topic_len + *payload_len_out) > mqtt_len) {
+          *payload_len_out = mqtt_len - 4 - topic_len;
+          if (*payload_len_out < 0) return -8;
+      }
+      *payload_out = (const uint8_t *)&data[offset];
+
+      return 0;
+  }
+  ```
+
+* **效果**：
+
+  * `data == NULL` 时立刻返回，不会 HardFault。
+
+  * 报文声称长度超过实际长度时返回错误码，不会越界读。
+
+  * 恶意构造的报文（topic\_len=0xFFFF）会被 `topic_len > (remaining_len - 2)` 拦下。
+
+  * payload 长度做了钳位，即使声称长度异常也不会让上层 memcpy 越界。
+
+* **教训**：**任何接收外部数据的解析函数，第一行必须是 NULL 检查，第二行必须是最小长度检查，之后每读一个"声称长度"字段都要立刻和"实际长度"对比**。外部输入 = 不可信输入，所有长度字段都是对方声称的，不能信。判断方法：全局问一句"这个指针从哪来？"→ 来自网络 / 串口 / Flash 参数区 → 必须按不可信输入处理。判别特征：偶发 HardFault 且复位前最后一次日志是协议解析函数入口，优先查 NULL 检查和边界校验。这条规则也适用于 Ymodem 解析、AT 命令响应解析、JSON 解析——所有外部数据入口。
+
+***
+
+## 坑 6：UART 接收链断裂 + 无 ErrorCallback（ESP8266 永久失联）
+
+* **现象**：系统跑一段时间（几小时到几天）后 ESP8266 突然收不到任何数据，MQTT 离线，AT 命令也没响应。板子没死（LED 还在闪、DHT11 还在打印），但网络功能彻底失联，只能按 Reset 恢复。
+
+* **根因**：两个独立但叠加的根因。
+
+  **根因 1（接收链断裂）**：HAL 的中断接收是"接收未完成"模式——每收到 1 字节就停一次，需要手动重启下一次接收。`HAL_UART_RxCpltCallback` 里重启接收的代码没检查返回值：
+
+  ```c
+  /* 修改前（接收链易断） */
+  void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+  {
+      if (huart->Instance == USART2) {
+          /* 拼接报文 ... */
+          /* 继续下一字节中断接收 */
+          HAL_UART_Receive_IT(&huart2, &esp_rx_last_byte, 1);   /* ← 返回值没查 */
+      }
+  }
+  ```
+
+  `HAL_UART_Receive_IT` 在以下情况会返回非 `HAL_OK`：
+
+  * 上一次接收还没完成（`huart->RxState != HAL_UART_STATE_READY`）。
+
+  * 句柄被其他任务同时操作。
+
+  * HAL 内部状态机异常。
+
+  返回非 OK 时**下一次中断接收不会被启动** → 物理上还能收到字节但 HAL 不再触发 RxCpltCallback → 字节丢失 → ESP8266 永久失联。这种现象一旦触发不可自愈。
+
+  **根因 2（没有 ErrorCallback）**：USART2 发生 ORE（Overrun Error，数据来不及取走被覆盖）/ FE（帧错误）/ NE（噪声）时，HAL 会调用 `HAL_UART_ErrorCallback`，但 HAL 的默认实现是 `weak` 空函数——什么都不做。更糟的是 HAL 内部会把 `huart->RxState` 置为 `HAL_UART_STATE_ERROR`，**之后所有** **`HAL_UART_Receive_IT`** **都返回** **`HAL_ERROR`**，接收链彻底断死。
+
+  ESP8266 在 AT 命令切换瞬间会突发连续字节流（比如 `> `  提示符 + 数据），ISR 还在处理上一字节时下一字节就到了 → ORE → 接收链断 → 永久失联。
+
+* **排查过程**：
+
+  1. 网络失联后板子没死 → 排除任务卡死，怀疑 USART2。
+  2. 失联时读 `huart2.RxState` → 是 `HAL_UART_STATE_READY` 但确实没中断进来。
+  3. 失联前最后几条日志里有偶发的 AT 响应缺失 → 怀疑接收链断了。
+  4. 进一步查 `huart2.ErrorCode` → 偶尔有 `HAL_UART_ERROR_ORE` 置位 → 但没有 ErrorCallback 处理。
+  5. 复盘：ORE 发生 → HAL 把 RxState 置成 ERROR → 下次 `HAL_UART_Receive_IT` 返回非 OK → 接收链断。
+
+* **解决**：
+
+  **修复 1（RxCpltCallback 检查返回值 + 失败重启）**：
+
+  ```c
+  /* app/Src/usart.c */
+  void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+  {
+      if (huart->Instance == USART2) {
+          uint8_t ch = esp_rx_last_byte;
+          /* 拼接报文 ... */
+          if (ch == '\n') {
+              if (g_esp_rx_sem_handle != NULL) {
+                  osSemaphoreRelease(g_esp_rx_sem_handle);
+              }
+          }
+          /* 继续下一字节中断接收，失败时 abort 后重试 */
+          if (HAL_UART_Receive_IT(&huart2, &esp_rx_last_byte, 1) != HAL_OK) {
+              HAL_UART_AbortReceive_IT(&huart2);                       /* 强制 abort 当前接收 */
+              HAL_UART_Receive_IT(&huart2, &esp_rx_last_byte, 1);     /* 再重启一次 */
+          }
+      }
+  }
+  ```
+
+  **修复 2（实现 ErrorCallback，错误后自动恢复）**：
+
+  ```c
+  /* app/Src/usart.c */
+  void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+  {
+      if (huart->Instance == USART2) {
+          /* 清错误标志 + abort + 重启接收 */
+          HAL_UART_AbortReceive_IT(huart);
+          HAL_UART_Receive_IT(huart, &esp_rx_last_byte, 1);
+      }
+  }
+  ```
+
+  `HAL_UART_AbortReceive_IT` 会把 `RxState` 强制重置回 `READY` 并清掉错误标志，之后 `HAL_UART_Receive_IT` 就能正常启动下一轮接收。注意 `ErrorCallback` 是在 ISR 上下文调用的，不能调任何带阻塞或 FreeRTOS API 的函数。
+
+* **效果**：
+
+  * `HAL_UART_Receive_IT` 失败时自动 abort + 重试，接收链不会断。
+
+  * ORE / FE / NE 发生时立刻清错误 + 重启接收，ESP8266 不会永久失联。
+
+  * 连续运行 72 小时无失联。
+
+* **教训**：**HAL 的 UART 中断接收是"一次性"模式，每次 RxCplt 后必须手动重启，且必须检查返回值**。不检查返回值 = 接收链随时可能断。**`HAL_UART_ErrorCallback`** **必须实现**，不实现 = ORE / FE 一发生就让 UART 进入永久错误状态。判别特征：板子没死（任务还在跑）但某个外设突然失联且不能自愈，优先查 HAL 的状态机是不是进入了 ERROR 态 + 有没有 ErrorCallback 兜底。`HAL_UART_AbortReceive_IT` 是恢复 UART 接收的标准急救动作——abort 会强制把状态机重置回 READY，比手动改 `RxState` 更安全（不会漏掉任何内部锁）。
+
+***
+
+## 坑 7：EXTI0 信号量 NULL（启动阶段按键 HardFault）
+
+* **现象**：上电瞬间按 WK\_UP 按键，系统立刻 HardFault，不复位就救不回。但系统跑起来之后（比如 1 秒后）按键完全正常。
+
+* **根因**：`HAL_GPIO_EXTI_Callback`（EXTI0 中断回调）里直接调用 `osSemaphoreRelease(g_irq_sem_handle)`，但 `g_irq_sem_handle` 这个信号量句柄是在 `App_IPC_Init()` 里才创建的，启动阶段（IPC 初始化之前）这个句柄是 `NULL`：
+
+  ```c
+  /* 修改前（致命） */
+  void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+  {
+      if (GPIO_Pin == KEY_WKUP_Pin) {
+          osSemaphoreRelease(g_irq_sem_handle);   /* ← 句柄可能是 NULL */
+      }
+  }
+  ```
+
+  上电流程：
+
+  1. `HAL_Init` → `MX_GPIO_Init` → 此时 EXTI0 中断已经使能（NVIC 已开）。
+  2. 接下来才是 `App_IPC_Init`（创建信号量）。
+
+  在 1 和 2 之间按 WK\_UP → EXTI0 触发 → `HAL_GPIO_EXTI_Callback` 调 `osSemaphoreRelease(NULL)` → FreeRTOS 内部解引用 NULL 指针 → HardFault。机械按键按下时触点弹跳会连发 20+ 次中断，启动窗口内任意一次都能触发。
+
+* **排查过程**：
+
+  1. 上电瞬间按键必 HardFault，跑起来后按键正常 → 怀疑启动时序问题。
+  2. 复位前单步 → 卡在 `osSemaphoreRelease` 内部，参数 `g_irq_sem_handle == NULL`。
+  3. 读 main.c 启动流程 → GPIO 初始化之后才创建 IPC，中间有个时间窗。
+
+* **解决**：在 ISR 里加 NULL 检查，句柄没创建好就跳过 release（最多丢这一次按键事件，不会崩）：
+
+  ```c
+  /* app/Src/main.c */
+  void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+  {
+      if (GPIO_Pin == KEY_WKUP_Pin) {
+          if (g_irq_sem_handle != NULL) {                  /* ← 句柄创建好才 release */
+              osSemaphoreRelease(g_irq_sem_handle);
+          }
+      }
+  }
+  ```
+
+* **效果**：启动阶段按 WK\_UP 不会 HardFault，IPC 创建好之后按键恢复正常。
+
+* **教训**：**所有 ISR 里用的 IPC 句柄（信号量 / 队列 / 互斥锁）必须先做 NULL 检查**。FreeRTOS 的句柄创建是动态的，不是编译期常量，启动早期一定是 NULL。判别特征：上电瞬间某个操作必 HardFault，跑起来后完全正常，优先查是不是 ISR 里用了还没初始化的句柄。这条规则对所有动态创建的资源都适用——动态分配的缓冲区、运行时打开的外设句柄、运行时注册的回调，使用前都必须判 NULL。
+
+***
+
+## 坑 8：YMODEM 序号回绕 + 结束帧处理（重传包重复写 Flash / 兼容性差）
+
+* **现象**：Ymodem 传输大文件（464KB APP bin）时偶发"同一包写两次"，导致 Flash 里某些扇区数据被重复写入；传输结束后偶尔卡在结束帧阶段几十秒才返回；不同 Ymodem 发送器（SecureCRT / Tera Term / Windows 自带）行为不一致，有的能传完有的卡死。
+
+* **根因**：三个独立的 Ymodem 协议实现细节问题。
+
+  **根因 1（序号回绕误判）**：Ymodem 协议包序号是 1 字节，从 1 开始递增，256 包之后回绕到 0 再到 1。原代码用 `expected_seq != 1` 判断"是否已经收到过第一个包"：
+
+  ```c
+  /* 修改前（序号回绕后误判） */
+  uint8_t expected_seq = 1;
+  ...
+  for (;;) {
+      ret = y_recv_frame(..., &seq);
+      ...
+      /* 用 expected_seq != 1 区分初始状态 */
+      if (expected_seq != 1 && seq == ...) {  /* ← 第 256 包后回绕到 0，再加 1 = 1，又"回到初始状态" */
+          ...
+      }
+      ...
+      expected_seq++;
+  }
+  ```
+
+  传到第 256 包时 `expected_seq` 从 0xFF 加 1 变成 0，从第 257 包开始又回到 1 → `expected_seq != 1` 这个判断又变成"初始状态" → 重新走初始分支 → 重发握手 / 误 ACK。
+
+  **根因 2（重传包重复写 Flash）**：Ymodem 发送方在 ACK 丢失或超时时会重发同一包。原代码没有识别"重传包"，只要 seq 匹配 expected\_seq 就写 Flash。如果发送方重传了一个已经写过的包，原代码会再写一次 → Flash 同一地址被写两次 → STM32F1 Flash 写两次同一地址会破坏数据（Flash 只能 1→0，第二次写会把原本是 0 的位变 0，但如果之前已经是 0 就无效）。
+
+  **根因 3（结束帧处理不兼容）**：Ymodem 协议规定结束流程是"发送方发 EOT → 接收方回 NAK → 发送方再发一次 EOT → 接收方回 ACK → 发送方发空块（seq=0）→ 接收方回 ACK"。但不同实现有差异：
+
+  * SecureCRT：发双 EOT（标准）
+
+  * Tera Term：发单 EOT
+
+  * 某些实现：EOT 后跟一个非 EOT 的额外字节
+
+  原代码假设是严格双 EOT 流程，单 EOT 发送器会卡住等第二个 EOT 直到超时；额外字节发送器会丢掉那个字节。
+
+* **排查过程**：
+
+  1. 传 464KB 时偶发同一偏移写两次 Flash → 在 `iap_on_packet` 加日志看 `total_received` 是不是回退 → 发现 `total_received` 没回退但 `last_acked_seq` 被重置。
+  2. 复盘序号回绕：第 256 包之后 expected\_seq 回到 1，被当成"初始状态"。
+  3. SecureCRT 单 EOT 测试：Ymodem 卡在等第二个 EOT 阶段直到 10 秒超时，虽然最后能成但慢。
+
+* **解决**：引入独立的 `first_packet_done` 标志替代 `expected_seq != 1` 判断，加 `last_acked_seq` 识别重传包，结束帧做兼容处理：
+
+  ```c
+  /* bootloader/Core/Src/ymodem.c Ymodem_Receive() */
+  uint8_t expected_seq = 1;
+  uint8_t last_acked_seq = 0;
+  uint8_t first_packet_done = 0;   /* 替代 expected_seq != 1 判断，防序号回绕误判 */
+  ...
+  for (;;) {
+      IWDG->KR = 0xAAAAU;           /* 喂狗：464KB 传输可能 40+ 秒 */
+      ret = y_recv_frame(y_data_buf, &data_len, &seq);
+
+      /* === 结束帧处理：EOT 后等第二个字节，兼容多种发送器 === */
+      if (ret == -1) {              /* 收到 EOT */
+          y_send_byte(errors == 0 ? Y_NAK : Y_ACK);
+          if (errors == 0) {
+              uint8_t second;
+              HAL_StatusTypeDef second_status = y_recv_byte(&second, Y_TIMEOUT_EOT);
+              if (second_status == HAL_OK && second == Y_EOT) {
+                  y_send_byte(Y_ACK);            /* 标准双 EOT */
+              } else if (second_status == HAL_TIMEOUT) {
+                  y_send_byte(Y_ACK);            /* 单 EOT 发送器：超时也算正常结束 */
+              } else if (second_status == HAL_OK && second == Y_CAN) {
+                  /* 发送方取消 */
+                  *received_size = total_received;
+                  y_cancel();
+                  return Y_ERR_CANCEL;
+              } else {
+                  /* EOT 后跟了非 EOT 的额外字节，丢掉并 ACK */
+                  y_rx_discard_pending();
+                  y_send_byte(Y_ACK);
+              }
+          }
+          break;
+      }
+      ...
+      /* === 重传包识别：seq 和上次 ACK 的一样，直接 ACK 不写 Flash === */
+      if (seq == last_acked_seq && first_packet_done) {
+          y_send_byte(Y_ACK);
+          continue;
+      }
+      if (seq != expected_seq || total_received >= file_total_size) {
+          y_send_byte(Y_NAK);
+          continue;
+      }
+      ...
+      /* 正常包：写 Flash */
+      total_received += write_len;
+      last_acked_seq = seq;                       /* 记录最近 ACK 的包号 */
+      expected_seq = (uint8_t)(expected_seq + 1U);
+      first_packet_done = 1;                      /* 标记已处理过至少一个包 */
+      y_send_byte(Y_ACK);
+  }
+  ```
+
+* **效果**：
+
+  * 序号回绕到 0 后再回到 1，`first_packet_done=1` 保持不变，不会被误判成初始状态。
+
+  * 重传包直接 ACK 不写 Flash，数据不会被破坏。
+
+  * 双 EOT / 单 EOT / 带额外字节的三种发送器都能正确结束。
+
+  * 464KB 传输稳定，不再有重复写。
+
+* **教训**：**Ymodem 协议的包序号是 1 字节 mod 256，必须用独立标志判断初始状态，不能靠序号本身**。`first_packet_done` 这种布尔标志和序号回绕完全解耦，是最稳妥的做法。**重传包必须识别**——任何"可靠传输"协议（Ymodem / Xmodem / TCP）都要处理 ACK 丢失导致的重传，识别方法是记 `last_acked_seq`，重传包直接 ACK 不做事。**协议兼容性**：实现协议时不能只对一种实现测，不同厂家的发送器行为差异巨大（双 EOT vs 单 EOT 是经典差异），结束流程要做超时兜底。判别特征：大文件传输偶发数据错乱，优先查是不是序号回绕 / 重传包没识别。
+
+***
+
+## 坑 9：Bootloader 无喂狗（长流程被看门狗复位死循环）
+
+* **现象**：给 APP 加 IWDG 看门狗后，Bootloader 进 WiFi OTA 或串口 IAP 时偶发复位——日志显示 `S5 Erasing flash...` 几秒后板子重启，又进 OTA，又复位，无限循环。Ymodem 传 464KB 时也是传到一半复位。
+
+* **根因**：IWDG 看门狗一旦启动（APP 里 `HAL_IWDG_Init` 之后）就**不可关闭**，只能靠持续喂狗（写 `IWDG->KR = 0xAAAA`）维持。Bootloader 是 APP 软复位后跳过去的，IWDG 还在跑。但 Bootloader 的关键长流程里没喂狗：
+
+  * `WiFi_IAP_Process` 主循环可能跑 30\~60 秒（擦 Flash + 收 464KB + 校验）。
+
+  * `IAP_ProcessSerial` → `Ymodem_Receive` 传 464KB 至少 40 秒。
+
+  * `FLASH_EraseAppArea` 擦 232 页耗时 7+ 秒。
+
+  * FAIL 状态的死循环 `while(1) { HAL_Delay(500); }` 看似没事但也没喂狗。
+
+  IWDG 超时通常配 5\~10 秒（看 APP 配置），Bootloader 长流程远超这个时间 → 看门狗复位 → 重启 → 又进长流程 → 又复位 → 死循环。
+
+* **排查过程**：
+
+  1. APP 加 IWDG 之后 Bootloader 偶发复位，复位前日志显示在 S5 / Ymodem 中途。
+  2. 不加 IWDG 的 Bootloader 跑完全程没事 → 确认是看门狗复位。
+  3. 读 Bootloader 代码 → 主循环和死循环里都没有 `IWDG->KR = 0xAAAA`。
+
+* **解决**：在所有可能超过 IWDG 超时时间的循环里加喂狗。统一用宏：
+
+  ```c
+  /* bootloader/Core/Src/main.c */
+  /* IWDG 喂狗宏：IWDG 未启用时写此寄存器无副作用，启用后自动喂狗 */
+  #define BOOT_KICK_DOG()  do { IWDG->KR = 0xAAAAU; } while(0)
+  ```
+
+  在 3 个关键位置喂狗：
+
+  **位置 1（main.c 所有死循环）**：
+
+  ```c
+  /* main.c IAP 失败后的死循环 */
+  while (1) {
+      BOOT_KICK_DOG();                              /* ← 喂狗 */
+      HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
+      HAL_Delay(100);
+  }
+
+  /* main.c CRC 失败 / APP 无效后的死循环 */
+  while (1) {
+      BOOT_KICK_DOG();                              /* ← 喂狗 */
+      HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
+      HAL_Delay(500);
+  }
+  ```
+
+  **位置 2（boot\_ota.c WiFi OTA 主循环 + FAIL 死循环）**：
+
+  ```c
+  /* boot_ota.c WiFi_IAP_Process 主循环 */
+  for (;;) {
+      uint32_t now = HAL_GetTick();
+      IWDG->KR = 0xAAAAU;                           /* ← 喂狗：主循环可能跑数十秒 */
+      switch (state) { ... }
+  }
+
+  /* boot_ota.c FAIL 状态死循环 */
+  case BOOT_OTA_FAIL:
+      printf("[WIFI-OTA] !!! FAIL state. Press KEY0+Reset for Serial IAP rescue.\r\n");
+      for (;;) {
+          IWDG->KR = 0xAAAAU;                       /* ← 喂狗：APP 加了 IWDG 后防复位循环 */
+          HAL_Delay(500);
+      }
+  ```
+
+  **位置 3（ymodem.c Ymodem 包循环）**：
+
+  ```c
+  /* ymodem.c Ymodem_Receive() 每收一包都喂狗 */
+  for (;;) {
+      uint16_t write_len;
+      IWDG->KR = 0xAAAAU;                           /* ← 喂狗：464KB 传输可能 40+ 秒 */
+      y_debug.phase = 2;
+      ret = y_recv_frame(y_data_buf, &data_len, &seq);
+      ...
+  }
+  ```
+
+* **效果**：
+
+  * Bootloader 任意长流程（OTA / Ymodem / Flash 擦除 / 死循环等待）都不会被 IWDG 复位。
+
+  * FAIL 状态的死循环 LED 慢闪不会被复位打断，用户有充足时间按 KEY0+Reset 救砖。
+
+  * IWDG 没启用时 `IWDG->KR = 0xAAAA` 写了也没副作用（寄存器不接受写入），所以这个喂狗动作对裸机 Bootloader（没开看门狗）完全无影响。
+
+* **教训**：**IWDG 一旦启动不可关闭，会贯穿 APP 软复位后的 Bootloader 流程**。Bootloader 的任何"可能耗时超过 IWDG 超时"的代码路径都必须主动喂狗。判断方法：全局问一句"这个循环 / 函数最坏情况跑多久？"→ 超过 IWDG 超时（通常 5\~10 秒）就必须喂狗。喂狗宏 `BOOT_KICK_DOG()` 写成"未启用也无副作用"的形式（直接写 `IWDG->KR`），这样 Bootloader 既能配合开了 IWDG 的 APP，也能独立跑在没开 IWDG 的环境。Flash 擦除（STM32F1 擦 232 页要 7+ 秒）是隐性的长操作，擦除函数内部没法喂狗（HAL 阻塞调用），所以必须在擦除前 / 后的循环里喂。判别特征：APP 加 IWDG 后 Bootloader 偶发复位且复位点在某个长流程中间，优先查是不是忘了喂狗。
+
+***
+
+## D16 成果总结
+
+* **9 个致命 / 偶发 bug 全部修复**：覆盖 ESP8266 接收竞态、互斥锁错配、UART 死锁、Bootloader 跳转校验、MQTT 越界、UART 接收链断裂、EXTI 信号量 NULL、Ymodem 协议细节、看门狗喂狗 9 个不同类别的稳定性问题。
+
+* **修改文件清单（共 9 个）**：
+
+  ```
+  app/Src/usart.c              ← 坑1（临界区） + 坑6（ErrorCallback + 接收链恢复）
+  app/Src/app_dht11.c          ← 坑2（互斥锁 acquire 返回值检查）
+  app/Src/app_esp8266.c        ← 坑2（互斥锁 acquire 返回值检查，多处）
+  app/Src/app_uart.c           ← 坑3（HAL_UART_Transmit 超时 100ms）
+  app/Src/main.c               ← 坑7（EXTI 信号量 NULL 检查）
+  bootloader/Core/Src/main.c          ← 坑4（CRC 门禁） + 坑9（BOOT_KICK_DOG 宏 + 死循环喂狗）
+  bootloader/Core/Src/jump_to_app.c   ← 坑4（地址校验 + SysTick 关停）
+  app/Src/mqtt_client.c        ← 坑5（NULL 检查 + 边界校验，3 个函数）
+  bootloader/Core/Src/boot_ota.c      ← 坑9（主循环 + FAIL 死循环喂狗）
+  bootloader/Core/Src/ymodem.c        ← 坑8（first_packet_done + last_acked_seq + 结束帧兼容） + 坑9（包循环喂狗）
+  ```
+
+
+
+* **编译 0 Error 0 Warning**：app + bootloader 双工程干净通过。硬件实测：72 小时连续运行无 HardFault / 卡死 / 失联，OTA 全链路（含中断电恢复、IAP 救砖、看门狗激活）全部通过。
+
+* **项目安全闭环**：D1\~D15 是功能开发与踩坑记录，D16 是对已有功能的稳定性加固——把"能跑通但有偶发崩"的代码升级为"长时间稳定运行且异常可恢复"的代码。9 个 bug 的修复思路（临界区保护、对称 acquire/release、有限超时、多重校验、不可信输入防御、状态机自愈、动态句柄判空、协议边界兼容、看门狗喂狗）是嵌入式 RTOS 稳定性的通用范式，可直接迁移到其他项目。
+
+
