@@ -1,6 +1,7 @@
-﻿#include "app_ipc.h"
+#include "app_ipc.h"
 #include "app_uart.h"
 #include <stdio.h>
+#include "app_lcd.h"
 
 /* ===== 4 大 IPC 全局句柄定义 ===== */
 osMessageQueueId_t g_led_queue_handle;
@@ -46,4 +47,6 @@ void App_IPC_Init(void)
     }
 
     uart_printf_mutex("[IPC] App_IPC_Init done: Queue+Mutex+EventGroup+BinSem created.\r\n");
+		    
+    App_Lcd_IPC_Init(); /*  LCD FSMC 互斥锁初始化 */
 }

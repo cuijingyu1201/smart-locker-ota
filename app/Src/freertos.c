@@ -1,4 +1,4 @@
-﻿/* USER CODE BEGIN Header */
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * File Name          : freertos.c
@@ -31,6 +31,7 @@
 #include "app_dht11.h"
 #include "app_esp8266.h"
 #include "app_uart.h"
+#include "app_lcd.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -243,6 +244,27 @@ void MX_FREERTOS_Init(void) {
     } else {
         App_StackMonitorRegister(taskESP8266_handle, "TaskESP8266",
                                  taskESP8266_attr.stack_size);
+    }
+		/* -------------------- TaskLcd -------------------- */
+    {
+        const osThreadAttr_t taskLcdTest_attr = {
+            .name       = "TaskLcdTest",
+            .attr_bits  = osThreadDetached,
+            .cb_mem     = NULL,
+            .cb_size    = 0,
+            .stack_mem  = NULL,
+            .stack_size = TASK_LCD_TEST_STACK_SIZE_BYTES,
+            .priority   = TASK_LCD_TEST_PRIORITY,
+            .tz_module  = 0,
+            .reserved   = 0
+        };
+        osThreadId_t taskLcdTest_handle = osThreadNew(TaskLcdTest, NULL, &taskLcdTest_attr);
+        if (taskLcdTest_handle == NULL) {
+            uart_printf_mutex("[ERROR] osThreadNew(TaskLcdTest) failed!\r\n");
+        } else {
+            App_StackMonitorRegister(taskLcdTest_handle, "TaskLcdTest",
+                                     taskLcdTest_attr.stack_size);
+        }
     }
   /* USER CODE END RTOS_THREADS */
 

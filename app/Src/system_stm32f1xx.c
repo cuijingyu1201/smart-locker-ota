@@ -1,4 +1,4 @@
-﻿/**
+/**
   ******************************************************************************
   * @file    system_stm32f1xx.c
   * @author  MCD Application Team
@@ -179,7 +179,12 @@ void SystemInit (void)
     SystemInit_ExtMemCtl(); 
   #endif /* DATA_IN_ExtSRAM */
 #endif 
-
+	
+	/* D17 关键修复：Bootloader 跳转前 __disable_irq() 关闭了全局中断，
+   * APP 必须在此重新开启，否则 TIM4（HAL 时基）中断无法触发，
+   * uwTick 不递增，HAL_Delay() 死循环。 */
+  __enable_irq();
+	
   /* Configure the Vector Table location -------------------------------------*/
 #if defined(USER_VECT_TAB_ADDRESS)
   SCB->VTOR = VECT_TAB_BASE_ADDRESS | VECT_TAB_OFFSET; /* Vector Table Relocation in Internal SRAM. */

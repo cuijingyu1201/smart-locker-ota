@@ -32,6 +32,7 @@
 #include "app_uart.h"
 #include "flash_param.h"
 #include "ota_manager.h"
+#include "app_lcd.h"
 
 /* ===================== fputc 重定向（D3 第二版互斥锁，原样保留） ===================== */
 #ifdef __GNUC__
@@ -43,6 +44,21 @@ PUTCHAR_PROTOTYPE
 {
     HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
     return ch;
+}
+
+/* ===================== _write 系统调用（MicroLib printf/fputs 批量输出重定向） =====================
+ * D17 关键修复：MicroLib 下带格式参数的 printf（如 lcd.c 中 printf("LCD ID:%x", id)）
+ * 会调用 _write 系统调用而非 fputc。若不实现 _write，MicroLib 默认 stub 会导致程序卡死。
+ * 此实现将 _write 重定向到 huart1，与 fputc/uart_printf_mutex 输出一致。
+ * 注意：多任务环境下应优先使用 uart_printf_mutex（带互斥锁），避免 printf 竞争。
+ * ============================================================================================ */
+int _write(int fd, const char *ptr, int len)
+{
+    (void)fd;
+    if ((ptr != NULL) && (len > 0) && (huart1.Instance != NULL)) {
+        (void)HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len, 100U);  /* 100ms 超时防 TX 故障死锁 */
+    }
+    return len;
 }
 /* USER CODE END Includes */
 
@@ -111,6 +127,7 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
+	App_Lcd_Init();
   /* USER CODE BEGIN 2 */
   uart_printf_mutex("\r\n############ APP v%u.%u.%u.%u (built %s %s) ############\r\n",
                     FW_VER_MAJOR, FW_VER_MINOR, FW_VER_PATCH, FW_BUILD_NUM,
@@ -124,7 +141,7 @@ int main(void)
 	uart_printf_mutex("IPC: Queue + Mutex + EventGroup + BinarySemaphore\r\n");
 	uart_printf_mutex("New: USART2(ESP8266) + DHT11(PE6) + TaskDHT11 + TaskESP8266\r\n");
 	
-		uart_printf_mutex("\r\n===== IOT OTA APP =====\r\n");
+	uart_printf_mutex("\r\n===== IOT OTA APP =====\r\n");
 	uart_printf_mutex("System Clock: %u Hz\r\n", SystemCoreClock);
 	uart_printf_mutex("Build: %s %s\r\n", __DATE__, __TIME__);
 
