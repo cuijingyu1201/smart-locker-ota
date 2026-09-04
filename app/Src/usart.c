@@ -19,10 +19,10 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "usart.h"
-#include <string.h>        /* memcpy / memset */
-#include "app_ipc.h"       /* g_esp_rx_sem_handle 信号量句柄 */
 
 /* USER CODE BEGIN 0 */
+#include <string.h>  
+#include "app_ipc.h" 
 /* ========= USART2(ESP8266) 接收缓冲区 ========= */
 #define ESP_RX_BUF_SIZE  512
 static uint8_t  esp_rx_buf[ESP_RX_BUF_SIZE];   /* 接收缓冲区 */

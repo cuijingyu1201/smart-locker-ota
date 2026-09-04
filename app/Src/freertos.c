@@ -32,6 +32,7 @@
 #include "app_esp8266.h"
 #include "app_uart.h"
 #include "app_lcd.h"
+#include "app_touch.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,7 +58,7 @@
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128U * 4U,
+  .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -151,8 +152,6 @@ void MX_FREERTOS_Init(void) {
   /* Create the thread(s) */
   /* creation of defaultTask */
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
-  App_StackMonitorRegister(defaultTaskHandle, "defaultTask",
-                           defaultTask_attributes.stack_size);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* -------------------- TaskLED -------------------- */
@@ -266,6 +265,21 @@ void MX_FREERTOS_Init(void) {
                                      taskLcdTest_attr.stack_size);
         }
     }
+		/* -------------------- TaskTouch -------------------- */
+		{
+				const osThreadAttr_t taskTouch_attr = {
+						.name       = "TaskTouch",
+						.attr_bits  = osThreadDetached,
+						.stack_size = TASK_TOUCH_STACK_SIZE_BYTES,
+						.priority   = TASK_TOUCH_PRIORITY,
+				};
+				osThreadId_t taskTouch_handle = osThreadNew(TaskTouch, NULL, &taskTouch_attr);
+				if (taskTouch_handle == NULL) {
+						uart_printf_mutex("[ERROR] osThreadNew(TaskTouch) failed!\r\n");
+				} else {
+						App_StackMonitorRegister(taskTouch_handle, "TaskTouch", taskTouch_attr.stack_size);
+				}
+		}
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */

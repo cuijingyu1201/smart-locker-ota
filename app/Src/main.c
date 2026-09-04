@@ -21,6 +21,7 @@
 #include "cmsis_os.h"
 #include "usart.h"
 #include "gpio.h"
+#include "fsmc.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -33,6 +34,7 @@
 #include "flash_param.h"
 #include "ota_manager.h"
 #include "app_lcd.h"
+#include "app_touch.h"
 
 /* ===================== fputc 重定向（D3 第二版互斥锁，原样保留） ===================== */
 #ifdef __GNUC__
@@ -104,7 +106,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+	__enable_irq();   /* Bootloader 跳转前 __disable_irq()，APP 必须重新开启全局中断 */
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -127,8 +129,10 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
-	App_Lcd_Init();
+  MX_FSMC_Init();
   /* USER CODE BEGIN 2 */
+	App_Lcd_Init();   /* LCD 初始化（FSMC 已由 MX_FSMC_Init 初始化，此处初始化 LCD 控制器 + 背光）*/
+	App_Touch_Init();
   uart_printf_mutex("\r\n############ APP v%u.%u.%u.%u (built %s %s) ############\r\n",
                     FW_VER_MAJOR, FW_VER_MINOR, FW_VER_PATCH, FW_BUILD_NUM,
                     __DATE__, __TIME__);

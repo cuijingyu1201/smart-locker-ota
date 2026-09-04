@@ -1,9 +1,9 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    gpio.h
-  * @brief   This file contains all the function prototypes for
-  *          the gpio.c file
+  * File Name          : FSMC.h
+  * Description        : This file provides code for the configuration
+  *                      of the FSMC peripheral.
   ******************************************************************************
   * @attention
   *
@@ -18,11 +18,10 @@
   */
 /* USER CODE END Header */
 /* Define to prevent recursive inclusion -------------------------------------*/
-#ifndef __GPIO_H__
-#define __GPIO_H__
-
+#ifndef __FSMC_H
+#define __FSMC_H
 #ifdef __cplusplus
-extern "C" {
+ extern "C" {
 #endif
 
 /* Includes ------------------------------------------------------------------*/
@@ -32,11 +31,15 @@ extern "C" {
 
 /* USER CODE END Includes */
 
+extern SRAM_HandleTypeDef hsram4;
+
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 
-void MX_GPIO_Init(void);
+void MX_FSMC_Init(void);
+void HAL_SRAM_MspInit(SRAM_HandleTypeDef* hsram);
+void HAL_SRAM_MspDeInit(SRAM_HandleTypeDef* hsram);
 
 /* USER CODE BEGIN Prototypes */
 
@@ -45,5 +48,12 @@ void MX_GPIO_Init(void);
 #ifdef __cplusplus
 }
 #endif
-#endif /*__ GPIO_H__ */
+#endif /*__FSMC_H */
 
+/**
+  * @}
+  */
+
+/**
+  * @}
+  */
