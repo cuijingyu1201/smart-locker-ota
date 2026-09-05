@@ -61,11 +61,15 @@ void Error_Handler(void);
 #define LED1_GPIO_Port GPIOE
 #define DHT11_DATA_Pin GPIO_PIN_6
 #define DHT11_DATA_GPIO_Port GPIOE
+#define IR_ITEM_Pin GPIO_PIN_0
+#define IR_ITEM_GPIO_Port GPIOC
 #define KEY_WKUP_Pin GPIO_PIN_0
 #define KEY_WKUP_GPIO_Port GPIOA
 #define KEY_WKUP_EXTI_IRQn EXTI0_IRQn
 #define LED0_Pin GPIO_PIN_5
 #define LED0_GPIO_Port GPIOB
+#define HALL_DOOR_Pin GPIO_PIN_0
+#define HALL_DOOR_GPIO_Port GPIOE
 
 /* USER CODE BEGIN Private defines */
 

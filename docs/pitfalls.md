@@ -2786,3 +2786,58 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 
 * **待办（后续 UI 阶段）**：触摸校准（四角 AD 采样反推 xfac/xc/yfac/yc，提升触摸精度与坐标对齐）；LCD ID 读时序余量持续观察。
 
+
+
+
+# D18：舵机电子锁 + 霍尔门检 + 红外物品检测（还未测试）（2026-09-05）
+
+
+## 坑2：舵机 PWM 时基参数计算
+
+- **现象**：舵机 SG90 要求 50Hz（20ms 周期），脉宽 0.5~2.5ms 对应 0~180°。需要精确计算 PSC 和 ARR。
+- **计算过程**：
+  - TIM3 在 APB1 上，APB1 定时器时钟 = 72MHz（APB1 预分频=2 时定时器时钟翻倍）。
+  - 目标：1 个计数器 tick = 1us（方便直接用 CCR 值表示脉宽微秒数）。
+  - PSC = 72 - 1 → 计数频率 = 72MHz / 72 = 1MHz → 1 tick = 1us ✅
+  - ARR = 20000 - 1 → 周期 = 20000us = 20ms = 50Hz ✅
+  - CCR = 1500 → 脉宽 = 1500us = 1.5ms → 舵机中位/开锁位 ✅
+  - CCR = 500 → 脉宽 = 500us = 0.5ms → 关锁位 ✅
+- **教训**：舵机 PWM 的关键公式：`PSC = (TIM_CLK / 目标分辨率) - 1`，`ARR = (周期 / 1tick时间) - 1`。把 tick 设成 1us 是最方便的——CCR 直接写微秒数，不用换算。
+
+## 坑3：新增任务后 TaskLED 栈余量下降
+
+- **现象**：D17 时 TaskLED `free=256B`，D18 新增 TaskLocker 后降到 `free=192B`（少了 64B）。
+- **根因**：FreeRTOS 任务数增加后，调度器在每次 PendSV 上下文切换时需要保存/恢复更多任务的寄存器状态，TaskLED 被切换出去时栈上压入的上下文略多。这不是 TaskLocker "偷"了 TaskLED 的栈，而是调度器开销分摊。
+- **影响**：192B free 仍在安全范围（FreeRTOS 最低要求 ~64B free），但余量偏紧。
+- **解决**：暂不调整。后续 D4 状态机任务如果再增加调度压力，把 TaskLED 栈从 512B 提到 768B。
+- **教训**：每新增一个任务，所有现有任务的栈余量都会略降（调度开销分摊）。栈分配要留 20% 余量给后续任务增长。
+
+
+
+## D18 成果
+
+### 已验证通过
+- **舵机 SG90（PA6, TIM3_CH1 PWM）**：50Hz 方波，LOCK(500us)↔UNLOCK(1500us) 每 2 秒循环，摇臂动作稳定。`App_Servo_Init/Lock/Unlock` 接口可直接被 D4 状态机调用。
+- **霍尔 A3144（PE0, GPIO_Input + Pull-up）**：磁铁靠近→DOOR_CLOSED(hall=0)，远离→DOOR_OPEN(hall=1)，去抖无抖动误判。`App_Sensor_GetDoor()` 接口可直接被 D4 状态机调用。
+- **所有原有功能不受影响**：LCD 显示、触摸画线、ESP8266+MQTT、DHT11 温湿度、LED 闪烁、OTA 参数管理全部正常。
+- **FreeRTOS 稳定**：12 个任务并发运行，`irq_cnt=0` 无中断风暴，系统连续运行 30+ 秒无 HardFault/卡死。
+
+### 待完成
+- **红外物品检测**：TCRT5000 检测距离不足（1~8mm），已下单红外对射分体模块（25~30cm）。到货后接线不变（VCC/GND/OUT→PC0），代码不用改，安装柜内左右壁正对即可。
+
+### 硬件清单
+| 器件 | 引脚 | 状态 |
+|---|---|---|
+| 舵机 SG90 | PA6 (TIM3_CH1 PWM) | ✅ 已验证 |
+| 霍尔 A3144 | PE0 (GPIO_Input + Pull-up) | ✅ 已验证 |
+| 红外对射模块 | PC0 (GPIO_Input + Pull-up) | ⏳ 待到货 |
+
+### D4 状态机接口预留
+- `App_Servo_Lock()` / `App_Servo_Unlock()` — 舵机开关锁
+- `App_Sensor_GetDoor()` → `DOOR_CLOSED` / `DOOR_OPEN` — 门状态
+- `App_Sensor_GetItem()` → `ITEM_PRESENT` / `ITEM_ABSENT` — 物品状态（待红外到货后验证）
+
+
+
+
+

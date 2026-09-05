@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 #include "fsmc.h"
@@ -35,6 +36,10 @@
 #include "ota_manager.h"
 #include "app_lcd.h"
 #include "app_touch.h"
+#include "app_servo.h"
+#include "app_sensor.h"
+#include "app_ipc.h"
+
 
 /* ===================== fputc 重定向（D3 第二版互斥锁，原样保留） ===================== */
 #ifdef __GNUC__
@@ -94,7 +99,6 @@ void MX_FREERTOS_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-#include "app_ipc.h"
 
 /* USER CODE END 0 */
 
@@ -130,9 +134,13 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_FSMC_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 	App_Lcd_Init();   /* LCD 初始化（FSMC 已由 MX_FSMC_Init 初始化，此处初始化 LCD 控制器 + 背光）*/
 	App_Touch_Init();
+	App_Servo_Init();    /* 舵机 PWM 启动，默认关锁 */
+	App_Sensor_Init();   /* 霍尔/红外传感器初始化 */
+	
   uart_printf_mutex("\r\n############ APP v%u.%u.%u.%u (built %s %s) ############\r\n",
                     FW_VER_MAJOR, FW_VER_MINOR, FW_VER_PATCH, FW_BUILD_NUM,
                     __DATE__, __TIME__);
