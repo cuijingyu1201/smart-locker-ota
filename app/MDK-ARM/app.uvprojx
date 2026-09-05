@@ -459,6 +459,21 @@
               <FilePath>..\Src\touch.c</FilePath>
             </File>
             <File>
+              <FileName>app_locker_test.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\app_locker_test.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_sensor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\app_sensor.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_servo.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\app_servo.c</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Src/main.c</FilePath>
@@ -606,19 +621,9 @@
               <FilePath>../Src/stm32f1xx_hal_timebase_tim.c</FilePath>
             </File>
             <File>
-              <FileName>app_locker_test.c</FileName>
+              <FileName>cabinet_fsm.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Src\app_locker_test.c</FilePath>
-            </File>
-            <File>
-              <FileName>app_sensor.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Src\app_sensor.c</FilePath>
-            </File>
-            <File>
-              <FileName>app_servo.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Src\app_servo.c</FilePath>
+              <FilePath>..\Src\cabinet_fsm.c</FilePath>
             </File>
           </Files>
         </Group>

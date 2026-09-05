@@ -283,21 +283,21 @@ void MX_FREERTOS_Init(void) {
 						App_StackMonitorRegister(taskTouch_handle, "TaskTouch", taskTouch_attr.stack_size);
 				}
 		}
-		/* -------------------- TaskLockerTest ( 舵机+霍尔+红外) -------------------- */
-    {
-        const osThreadAttr_t taskLocker_attr = {
-            .name       = "TaskLocker",
-            .attr_bits  = osThreadDetached,
-            .stack_size = TASK_LOCKER_STACK_SIZE_BYTES,
-            .priority   = TASK_LOCKER_PRIORITY,
-        };
-        osThreadId_t h = osThreadNew(TaskLockerTest, NULL, &taskLocker_attr);
-        if (h == NULL) {
-            uart_printf_mutex("[ERROR] osThreadNew(TaskLockerTest) failed!\r\n");
-        } else {
-            App_StackMonitorRegister(h, "TaskLocker", taskLocker_attr.stack_size);
-        }
-    }
+		/* -------------------- TaskLocker (柜子状态机) -------------------- */
+		{
+				const osThreadAttr_t taskLocker_attr = {
+						.name       = "TaskLocker",
+						.attr_bits  = osThreadDetached,
+						.stack_size = TASK_LOCKER_STACK_SIZE_BYTES,
+						.priority   = TASK_LOCKER_PRIORITY,
+				};
+				osThreadId_t h = osThreadNew(TaskLocker, NULL, &taskLocker_attr);
+				if (h == NULL) {
+						uart_printf_mutex("[ERROR] osThreadNew(TaskLocker) failed!\r\n");
+				} else {
+						App_StackMonitorRegister(h, "TaskLocker", taskLocker_attr.stack_size);
+				}
+		}
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */

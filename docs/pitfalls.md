@@ -2792,7 +2792,7 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 # D18：舵机电子锁 + 霍尔门检 + 红外物品检测（还未测试）（2026-09-05）
 
 
-## 坑2：舵机 PWM 时基参数计算
+## 坑1：舵机 PWM 时基参数计算
 
 - **现象**：舵机 SG90 要求 50Hz（20ms 周期），脉宽 0.5~2.5ms 对应 0~180°。需要精确计算 PSC 和 ARR。
 - **计算过程**：
@@ -2804,7 +2804,7 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
   - CCR = 500 → 脉宽 = 500us = 0.5ms → 关锁位 ✅
 - **教训**：舵机 PWM 的关键公式：`PSC = (TIM_CLK / 目标分辨率) - 1`，`ARR = (周期 / 1tick时间) - 1`。把 tick 设成 1us 是最方便的——CCR 直接写微秒数，不用换算。
 
-## 坑3：新增任务后 TaskLED 栈余量下降
+## 坑2：新增任务后 TaskLED 栈余量下降
 
 - **现象**：D17 时 TaskLED `free=256B`，D18 新增 TaskLocker 后降到 `free=192B`（少了 64B）。
 - **根因**：FreeRTOS 任务数增加后，调度器在每次 PendSV 上下文切换时需要保存/恢复更多任务的寄存器状态，TaskLED 被切换出去时栈上压入的上下文略多。这不是 TaskLocker "偷"了 TaskLED 的栈，而是调度器开销分摊。
@@ -2836,6 +2836,50 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 - `App_Servo_Lock()` / `App_Servo_Unlock()` — 舵机开关锁
 - `App_Sensor_GetDoor()` → `DOOR_CLOSED` / `DOOR_OPEN` — 门状态
 - `App_Sensor_GetItem()` → `ITEM_PRESENT` / `ITEM_ABSENT` — 物品状态（待红外到货后验证）
+
+
+---
+
+
+
+# D19（D4）：1 柜状态机 cabinet_fsm（6 态 + 双传感器融合）（2026-09-05）
+
+
+## D19（D4）成果（目前只做了初步的代码测试，测试还不够完整）
+
+### 已验证通过
+- **1 柜状态机 6 态全流程**：CLOSED→OPENING→WAIT_PICKUP→TIMEOUT_CLOSING→CLOSED 跑通，串口打印完整状态转换序列。
+- **开门超时进 FAULT**：开锁后 5 秒内门没推开 → `[CAB] FAULT! reason=1`，舵机自动关锁。
+- **关门超时进 FAULT**：关锁后 5 秒内门没关上 → `[CAB] FAULT! reason=3`。
+- **FAULT 态拒绝开柜**：FAULT 态下按 WK_UP → `[CAB] Open request IGNORED (state=4).`。
+- **不接红外降级运行**：`CABINET_USE_IR=0` 时只靠霍尔+超时跑通全流程，红外到货后改宏=1 启用双传感器融合。
+- **所有原有功能不受影响**：LCD、触摸、ESP8266+MQTT、DHT11、LED、OTA 参数全部正常。
+- **FreeRTOS 稳定**：12 个任务并发，`irq_cnt=0`，连续运行 60+ 秒无 HardFault。
+
+### 状态机对外接口（供 D5/D9/D10/D11 调用）
+| 接口 | 作用 | 调用方 |
+|---|---|---|
+| `Cabinet_FSM_Init()` | 上电初始化状态机 | main.c / freertos.c |
+| `Cabinet_FSM_OpenRequest()` | 触发开柜 | MQTT 命令 / LCD 按钮 |
+| `Cabinet_FSM_GetState()` | 读当前状态 | LCD 显示 / MQTT 上报 |
+| `Cabinet_FSM_GetFaultReason()` | 读故障原因 | 告警上报 |
+
+```
+
+### 状态机配置宏（cabinet_fsm.h / cabinet_fsm.c 顶部）
+| 宏 | 默认值 | 含义 |
+|---|---|---|
+| `CABINET_USE_IR` | 0 | 0=不接红外（只靠霍尔+超时），1=接红外（双传感器融合） |
+| `OPENING_TIMEOUT_MS` | 5000 | 开门超时（5 秒后门没推开进 FAULT） |
+| `PICKUP_TIMEOUT_MS` | 5000 | 取件超时（5 秒后自动关门，产品值 10000） |
+| `CLOSING_TIMEOUT_MS` | 5000 | 关门超时（5 秒后门没关上进 FAULT） |
+| `KEY_FAULT_CLEAR_MS` | 3000 | 长按 KEY1 清故障时长（3 秒） |
+
+### 待完成（硬件到货后）
+- **红外取件检测**：红外对射模块到货后改 `CABINET_USE_IR=1`，验证红外有物→无物触发立即关门。
+- **舵机角度微调**：箱子锁机构做好后微调 `SERVO_PWM_LOCK_US` / `SERVO_PWM_UNLOCK_US`。
+- **霍尔安装校准**：箱子做好后调整磁铁位置，确保关门时霍尔正对磁铁。
+- **KEY1 清故障实测**：确认 PE3 配置正确后，长按 KEY1 3 秒清 FAULT。
 
 
 

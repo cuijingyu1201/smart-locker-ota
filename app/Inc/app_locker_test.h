@@ -2,11 +2,11 @@
 #define APP_LOCKER_TEST_H
 #include "cmsis_os2.h"
 
-/* D18(D3) 最小验证任务：舵机开/关锁循环 + 霍尔/红外电平监控 */
-#define TASK_LOCKER_STACK_SIZE_BYTES   (512U * 4U)   /* 2048B，和方案一致 */
-#define TASK_LOCKER_PRIORITY           (osPriorityNormal)
+/*  柜子状态机任务（替换原 TaskLockerTest） */
+#define TASK_LOCKER_STACK_SIZE_BYTES   (512U * 4U)   /* 2048B */
+#define TASK_LOCKER_PRIORITY           (osPriorityAboveNormal)  /* 比传感器高，及时响应 */
 
-void TaskLockerTest(void *argument);
+void TaskLocker(void *argument);   /* 状态机主任务 */
 
 #endif
 

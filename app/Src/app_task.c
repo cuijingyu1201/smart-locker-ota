@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include "app_ipc.h"
 #include "app_uart.h"
+#include "cabinet_fsm.h"
 
 uint32_t g_irq_cnt = 0;   /* 中断计数，TaskSemHandle 写，TaskPrint 读 */
 
@@ -121,6 +122,7 @@ void TaskPrint(void *argument)
 void TaskKeyPoll(void *argument)
 {
     (void)argument;
+    static uint8_t last_st = 0;
     for (;;)
     {
         /* 精英板 WK_UP：按下=高电平(SET)，松开=低电平(RESET) */
@@ -128,10 +130,16 @@ void TaskKeyPoll(void *argument)
         if (st == GPIO_PIN_SET)
         {
             osEventFlagsSet(g_event_group_handle, BIT_KEY_DOWN);
+            /* D4 临时测试：WK_UP 按下触发开柜（沿触发，只触发一次） */
+            if (last_st == 0) {
+                Cabinet_FSM_OpenRequest();
+            }
+            last_st = 1;
         }
         else
         {
             osEventFlagsClear(g_event_group_handle, BIT_KEY_DOWN);
+            last_st = 0;
         }
         osDelay(20);
     }
