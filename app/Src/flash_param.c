@@ -249,8 +249,6 @@ void FlashParam_Print(const flash_param_t *p)
     uart_printf_mutex("  magic_header    = 0x%08X (%c%c%c%c)\r\n", p->magic_header,
            (p->magic_header >> 0) & 0xFF, (p->magic_header >> 8) & 0xFF,
            (p->magic_header >> 16) & 0xFF, (p->magic_header >> 24) & 0xFF);
-    uart_printf_mutex("  struct_crc32    = 0x%08X\r\n", p->struct_crc32);
-    uart_printf_mutex("  struct_version  = %lu\r\n", p->struct_version);
     uart_printf_mutex("  fw_version      = %u.%u.%u (build %u)\r\n",
            p->fw_ver_major, p->fw_ver_minor, p->fw_ver_patch, p->fw_build_num);
     uart_printf_mutex("  fw_size_bytes   = %lu (0x%08lX)\r\n", p->fw_size_bytes, p->fw_size_bytes);
@@ -259,17 +257,10 @@ void FlashParam_Print(const flash_param_t *p)
            (p->ota_request_magic >> 0) & 0xFF, (p->ota_request_magic >> 8) & 0xFF,
            (p->ota_request_magic >> 16) & 0xFF, (p->ota_request_magic >> 24) & 0xFF);
     uart_printf_mutex("  ota_new_fw_crc  = 0x%08X\r\n", p->ota_new_fw_crc32);
-    uart_printf_mutex("  ota_new_fw_size = %lu\r\n", p->ota_new_fw_size);
-    uart_printf_mutex("  ota_new_version = %u.%u.%u.%u\r\n",
-                      p->ota_new_fw_ver_major, p->ota_new_fw_ver_minor,
-                      p->ota_new_fw_ver_patch, p->ota_new_fw_build_num);
-    uart_printf_mutex("  ota_rollback    = %u\r\n", p->ota_rollback_count);
     uart_printf_mutex("  boot_count      = %lu\r\n", p->boot_count);
     uart_printf_mutex("  last_reset_reas = 0x%08X\r\n", p->last_reset_reason);
     uart_printf_mutex("  last_ota_result = %lu\r\n", p->last_ota_result);
     uart_printf_mutex("  device_id       = %.16s\r\n", p->device_id);
     uart_printf_mutex("  mqtt_prefix     = %.32s\r\n", p->mqtt_topic_prefix);
-    uart_printf_mutex("  tail_marker     = 0x%08X\r\n", p->tail_marker);
-    uart_printf_mutex("  tail_crc32      = 0x%08X\r\n", p->tail_crc32);
     uart_printf_mutex("=========================================\r\n\r\n");
 }

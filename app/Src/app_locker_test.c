@@ -3,10 +3,10 @@
 #include "app_sensor.h"
 #include "app_uart.h"
 
-/* D3 ×îĞ¡²âÊÔ£¨²»×ö×´Ì¬»ú£¬×´Ì¬»úÊÇ D4£©£º
- *  - Ã¿ 2 Ãë¶æ»ú ¹ØËø¡ú¿ªËø¡ú¹ØËø Ñ­»·
- *  - Ã¿ 20ms É¨Ãè»ô¶û/ºìÍâ£¨È¥¶¶£©£¬×´Ì¬±ä»¯ÓÉ sensor Çı¶¯´òÓ¡
- *  - Ã¿ 2 Ãë´òÓ¡Ò»´ÎÔ­Ê¼µçÆ½£¬·½±ãÈ·ÈÏºìÍâ¼«ĞÔ */
+/* D3 ï¿½ï¿½Ğ¡ï¿½ï¿½ï¿½Ô£ï¿½ï¿½ï¿½ï¿½ï¿½×´Ì¬ï¿½ï¿½ï¿½ï¿½×´Ì¬ï¿½ï¿½ï¿½ï¿½ D4ï¿½ï¿½ï¿½ï¿½
+ *  - Ã¿ 2 ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Ñ­ï¿½ï¿½
+ *  - Ã¿ 20ms É¨ï¿½ï¿½ï¿½ï¿½ï¿½/ï¿½ï¿½ï¿½â£¨È¥ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½×´Ì¬ï¿½ä»¯ï¿½ï¿½ sensor ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó¡
+ *  - Ã¿ 2 ï¿½ï¿½ï¿½Ó¡Ò»ï¿½ï¿½Ô­Ê¼ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È·ï¿½Ïºï¿½ï¿½â¼«ï¿½ï¿½ */
 void TaskLockerTest(void *argument)
 {
     (void)argument;
@@ -14,23 +14,17 @@ void TaskLockerTest(void *argument)
     uint16_t tick = 0;
 
     for (;;) {
-        App_Sensor_Scan();              /* 20ms ÖÜÆÚÈ¥¶¶É¨Ãè */
+        App_Sensor_Scan();              /* 20ms ï¿½ï¿½ï¿½ï¿½È¥ï¿½ï¿½É¨ï¿½ï¿½ */
         tick++;
 
-        if (tick >= 100U) {             /* 100¡Á20ms = 2s */
+        if (tick >= 100U) {             /* 100Ã—20ms = 2s */
             tick = 0;
             unlock ^= 1U;
             if (unlock) {
-                App_Servo_Unlock();     /* 1.5ms ¿ªËø */
+                App_Servo_Unlock();     /* 1.5ms å¼€é” */
             } else {
-                App_Servo_Lock();       /* 0.5ms ¹ØËø */
+                App_Servo_Lock();       /* 0.5ms å…³é” */
             }
-            /* ÖÜÆÚ´òÓ¡Ô­Ê¼µçÆ½£¬ÓÃÀ´ºË¶ÔºìÍâ/»ô¶ûÂß¼­ */
-            uart_printf_mutex("[RAW] hall(PE0)=%u  ir(PC0)=%u  door=%d item=%d\r\n",
-                              (unsigned)App_Sensor_RawHall(),
-                              (unsigned)App_Sensor_RawIR(),
-                              (int)App_Sensor_GetDoor(),
-                              (int)App_Sensor_GetItem());
         }
         osDelay(20);
     }

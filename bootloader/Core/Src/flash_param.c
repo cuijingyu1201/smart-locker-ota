@@ -1,4 +1,4 @@
-﻿#include "flash_param.h"
+#include "flash_param.h"
 #include "flash_if.h"   /* FLASH_ErasePages / FLASH_WriteBuf / FLASH_ReadWord */
 #include <stdio.h>
 #include <string.h>
@@ -180,8 +180,6 @@ void FlashParam_Print(const flash_param_t *p)
     printf("  magic_header    = 0x%08X (%c%c%c%c)\r\n", p->magic_header,
            (p->magic_header >> 0) & 0xFF, (p->magic_header >> 8) & 0xFF,
            (p->magic_header >> 16) & 0xFF, (p->magic_header >> 24) & 0xFF);
-    printf("  struct_crc32    = 0x%08X\r\n", p->struct_crc32);
-    printf("  struct_version  = %u\r\n", p->struct_version);
     printf("  fw_version      = %u.%u.%u (build %u)\r\n",
            p->fw_ver_major, p->fw_ver_minor, p->fw_ver_patch, p->fw_build_num);
     printf("  fw_size_bytes   = %u (0x%08lX)\r\n", p->fw_size_bytes, p->fw_size_bytes);
@@ -190,18 +188,11 @@ void FlashParam_Print(const flash_param_t *p)
            (p->ota_request_magic >> 0) & 0xFF, (p->ota_request_magic >> 8) & 0xFF,
            (p->ota_request_magic >> 16) & 0xFF, (p->ota_request_magic >> 24) & 0xFF);
     printf("  ota_new_fw_crc  = 0x%08X\r\n", p->ota_new_fw_crc32);
-    printf("  ota_new_fw_size = %u\r\n", p->ota_new_fw_size);
-    printf("  ota_new_version = %u.%u.%u.%u\r\n",
-           p->ota_new_fw_ver_major, p->ota_new_fw_ver_minor,
-           p->ota_new_fw_ver_patch, p->ota_new_fw_build_num);
-    printf("  ota_rollback    = %u\r\n", p->ota_rollback_count);
     printf("  boot_count      = %u\r\n", p->boot_count);
     printf("  last_reset_reas = 0x%08X\r\n", p->last_reset_reason);
     printf("  last_ota_result = %u\r\n", p->last_ota_result);
     printf("  device_id       = %.16s\r\n", p->device_id);
     printf("  mqtt_prefix     = %.32s\r\n", p->mqtt_topic_prefix);
-    printf("  tail_marker     = 0x%08X\r\n", p->tail_marker);
-    printf("  tail_crc32      = 0x%08X\r\n", p->tail_crc32);
     printf("=========================================\r\n\r\n");
 }
 

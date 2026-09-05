@@ -34,7 +34,6 @@
 #include "lcd.h"
 #include "lcdfont.h"
 #include <stdio.h>
-#include "app_uart.h"   /* D17 诊断：用 uart_printf_mutex 跟踪 lcd_init 执行路径 */
 
 #define delay_ms(ms)  HAL_Delay(ms)
 /* lcd_ex.c存放各个LCD驱动IC的寄存器初始化部分代码,以简化lcd.c,该.c文件
@@ -605,7 +604,6 @@ void lcd_set_window(uint16_t sx, uint16_t sy, uint16_t width, uint16_t height)
  */
 void lcd_init(void)
 {
-		uart_printf_mutex("[LCDDBG] lcd_init ENTER\r\n");  /* ← 加这行 */
 	
     GPIO_InitTypeDef gpio_init_struct;
     FSMC_NORSRAM_TimingTypeDef fsmc_read_handle;
@@ -665,15 +663,12 @@ void lcd_init(void)
     /* 某些液晶驱动IC的写信号脉宽，最少也得50ns。 */
     fsmc_write_handle.AccessMode = FSMC_ACCESS_MODE_A;    /* 模式A */
 		
-		uart_printf_mutex("[LCDDBG] before HAL_SRAM_Init\r\n");  /* ← 加这行 */
     
     HAL_SRAM_Init(&g_sram_handle, &fsmc_read_handle, &fsmc_write_handle);
 		
-		uart_printf_mutex("[LCDDBG] HAL_SRAM_Init done\r\n");  /* ← 加这行 */
 		
     HAL_Delay(50);        /* 初始化FSMC后,必须等待一定时间才能开始初始化 */
 		
-		uart_printf_mutex("[LCDDBG] before FSMC ID read\r\n");  /* ← 加这行 */
 
     /* 尝试9341 ID的读取 */
     lcd_wr_regno(0XD3);
@@ -758,14 +753,12 @@ void lcd_init(void)
         }
     }
 		
-		uart_printf_mutex("[LCDDBG] ID read done, id=0x%04X\r\n", (unsigned)lcddev.id);  /* ← 加这行 */
 
 
     /* 特别注意, 如果在main函数里面屏蔽串口1初始化, 则会卡死在printf
      * 里面(卡死在f_putc函数), 所以, 必须初始化串口1, 或者屏蔽掉下面
      * 这行 printf 语句 !!!!!!!
      */
-    printf("LCD ID:%x\r\n", lcddev.id); /* 打印LCD ID */
 
     if (lcddev.id == 0X7789)
     {

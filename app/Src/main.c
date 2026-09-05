@@ -147,15 +147,6 @@ int main(void)
 	uart_printf_mutex("\r\n===== IOT OTA APP =====\r\n");
 	uart_printf_mutex("System Clock: %u Hz\r\n", SystemCoreClock);
 	uart_printf_mutex("Build: %s %s\r\n", __DATE__, __TIME__);
-	uart_printf_mutex("HAL Timebase = TIM4, FreeRTOS Tick = SysTick\r\n");
-	uart_printf_mutex("IPC: Queue + Mutex + EventGroup + BinarySemaphore\r\n");
-	uart_printf_mutex("LED0(PB5) LED1(PE5) Blinking via TaskLED, KEY_WKUP(PA0) EXTI0\r\n");
-	uart_printf_mutex("IPC: Queue + Mutex + EventGroup + BinarySemaphore\r\n");
-	uart_printf_mutex("New: USART2(ESP8266) + DHT11(PE6) + TaskDHT11 + TaskESP8266\r\n");
-	
-	uart_printf_mutex("\r\n===== IOT OTA APP =====\r\n");
-	uart_printf_mutex("System Clock: %u Hz\r\n", SystemCoreClock);
-	uart_printf_mutex("Build: %s %s\r\n", __DATE__, __TIME__);
 
 	/* Flash maintenance belongs to boot, not to a small periodic task stack. */
 	(void)FlashParam_InitOnBoot();

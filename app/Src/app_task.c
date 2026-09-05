@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file    app_task.c
  * @brief   D2: FreeRTOS 业务任务实现（LED/Print/IdleHook）
  */
@@ -11,7 +11,7 @@ uint32_t g_irq_cnt = 0;   /* 中断计数，TaskSemHandle 写，TaskPrint 读 */
 
 #define STACK_MONITOR_MAX_TASKS       7U
 #define STACK_WARN_MIN_FREE_BYTES     128U
-#define STACK_REPORT_PERIOD_TICKS     pdMS_TO_TICKS(30000U)
+#define STACK_REPORT_PERIOD_TICKS     pdMS_TO_TICKS(300000U)   /* 5分钟强制报告一次 */
 
 typedef struct {
     osThreadId_t thread_id;
@@ -75,8 +75,6 @@ void TaskLED(void *argument)
         msg.led0_state = (uint8_t)HAL_GPIO_ReadPin(LED0_GPIO_Port, LED0_Pin);
         osMessageQueuePut(g_led_queue_handle, &msg, 0, 0);
 
-        uart_printf_mutex("[TASK_LED ] rtos_tick=%lu\r\n", (unsigned long)msg.rtos_tick);
-
         uint32_t flags = osEventFlagsWait(g_event_group_handle, BIT_KEY_DOWN,
                                           osFlagsWaitAny, 0);
         if ((int32_t)flags > 0 && (flags & BIT_KEY_DOWN)) {
@@ -92,28 +90,21 @@ void TaskPrint(void *argument)
 {
     (void)argument;
     led_msg_t rx_msg;
-    uint32_t msg_cnt;
     uint32_t last_stack_report_tick = 0U;
     for (;;)
     {
-        osDelay(1000);
+        osDelay(10000);
 
         uart_printf_mutex("---------- RTOS STATS ----------\r\n");
 
-        /* 从队列把所有积压的 LED 消息读出来打印 */
-        msg_cnt = 0;
+        /* 清空 LED 队列积压消息，避免队列满后丢消息 */
         while (osMessageQueueGet(g_led_queue_handle, &rx_msg, NULL, 0) == osOK)
         {
-            uart_printf_mutex("  [Q] tick=%lu led0=%u\r\n",
-                   (unsigned long)rx_msg.rtos_tick, (unsigned)rx_msg.led0_state);
-            msg_cnt++;
         }
-        uart_printf_mutex("  queue_msg_count = %lu\r\n", (unsigned long)msg_cnt);
 
         uart_printf_mutex("uptime     = %lu s\r\n", (unsigned long)(osKernelGetTickCount() / 1000));
         uart_printf_mutex("rtos_tick  = %lu\r\n", (unsigned long)osKernelGetTickCount());
-        uart_printf_mutex("hal_tick   = %lu\r\n", (unsigned long)HAL_GetTick());
-        uart_printf_mutex("n_tasks    = %u\r\n", (unsigned)uxTaskGetNumberOfTasks());
+        uart_printf_mutex("irq_cnt    = %lu\r\n", (unsigned long)g_irq_cnt);
         {
             uint32_t now = osKernelGetTickCount();
             uint8_t force_report = ((now - last_stack_report_tick) >= STACK_REPORT_PERIOD_TICKS) ||
@@ -124,7 +115,6 @@ void TaskPrint(void *argument)
             }
         }
         uart_printf_mutex("--------------------------------\r\n");
-				uart_printf_mutex("irq_cnt    = %lu\r\n", (unsigned long)g_irq_cnt);
     }
 }
 /* ===================== TaskKeyPoll：轮询 PA0 按键状态 ===================== */
