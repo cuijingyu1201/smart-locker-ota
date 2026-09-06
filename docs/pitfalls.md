@@ -2885,3 +2885,62 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 
 
 
+# D20（D5）：MQTT 主题改造 + 柜态/告警上报 + 远程开柜 + 指数退避重连（2026-09-06）
+
+> 本阶段只改动 `app/Src/app_esp8266.c` 一个文件，`cabinet_fsm.c` 零改动（MQTT 任务轮询状态机接口，保持解耦）。
+
+
+## 坑1：ARMCC 不支持中文字符串字面量，missing closing quote
+
+* **现象**：告警 switch 里写了中文字符串（如 `msg = "传感器异常"`），编译报：
+
+  ```
+  warning: #870-D: invalid multibyte character sequence
+  error: #8: missing closing quote
+  error: #65: expected a ";"
+  ```
+
+  错误输出里中文变成乱码（`浼犳劅鍣ㄥ紓甯?`）。
+
+* **根因**：源文件是 UTF-8 无 BOM，ARMCC V5.06 按 GBK 解析**字符串字面量**：UTF-8 中文占 3 字节、GBK 中文占 2 字节，字节流被错误切分后某个字节被误判为闭合引号 `"`，字符串提前结束引发连锁语法错误。
+
+* **解决**：告警 `msg` 全部改成英文短语：`lock_stuck` / `pickup_timeout` / `door_not_closed` / `sensor_abnormal`；`type` 本来就是英文短名。MQTTX 收到的告警为 `{"type":"fault_lock","msg":"lock_stuck"}`。
+
+* **教训**：ARMCC V5 工程里**要编译进固件的字符串字面量一律用英文**；中文只能放在注释里（注释字节不参与语法解析，乱码不影响编译）。云端/运维需要中文含义时，按 `type` 字段查表翻译。这与"ARMCC 不支持 UTF-8 BOM"同属编码约束族。
+
+
+## D20 成果
+
+### 已验证通过
+
+* **MQTT 主题 1 柜版改造**：`iot/cab001/status`（上行柜态）、`iot/cab001/alert`（上行告警）、`iot/cab001/cmd`（下行命令订阅），编译 0 Error。
+
+* **柜态上报**：MQTTX 每 5 秒收到 `iot/cab001/status`，payload 为 `{"door":"closed","item":"no","temp":23,"humi":65,"uptime":123}`；`door` 字段随状态机实时变化（closed/open/fault 三态实测均正确）。
+
+* **远程开柜**：MQTTX 向 `iot/cab001/cmd` 发 `{"cmd":"open"}` → 串口 `CMD: OPEN cabinet (accepted)` → 舵机 UNLOCK(1500us) → CLOSED→OPENING；FAULT 态下发 open 被拒（`rejected (state=FAULT)`），保护逻辑正确。
+
+* **故障告警 fault\_lock**：开门超时（reason=1）→ `iot/cab001/alert` 收到 `{"type":"fault_lock","msg":"lock_stuck"}`，串口 `TX ALERT ... type=fault_lock` + `SEND OK`。
+
+* **故障告警 fault\_door**：关门超时（reason=3）→ `iot/cab001/alert` 收到 `{"type":"fault_door","msg":"door_not_closed"}`。
+
+* **边沿触发**：FAULT 持续期间告警只发一条不刷屏；KEY1 清故障（FAULT→CLOSED）后再次触发故障，第二条告警正常发出。
+
+* **KEY1 清故障**：长按 PE3 3 秒，串口 `FAULT -> CLOSED` + `KEY1 long-press: FAULT cleared.`。
+
+* **指数退避重连**：断网后重连间隔 1→2→4→8→30→60s 递增，含 ±10% 随机抖动，60s 封顶；恢复网络后自动重连成功，再次断网退避从 1s 重新开始（复位生效）。
+
+* **原有功能不受影响**：LCD、触摸、DHT11、OTA 参数管理、1 柜状态机全部正常；TaskESP8266 栈余量 `free=1672B/2048B` 充足，`irq_cnt=0`。
+
+
+### 待完成
+
+* **D9（LCD 界面）**：在屏幕上显示 MQTT 连接状态（联网/断连/重连档位）和当前柜态，免去盯串口。
+
+* **红外复测**：红外对射模块到货后 `CABINET_USE_IR=1`，告警逻辑不受影响，但需复测 WAIT\_PICKUP 段取件检测路径。
+
+* **OTA 全流程**：cmd 主题已统一，后续可直接用 `{"cmd":"ota",...}` 在新主题上验证 OTA 升级。
+
+
+
+
+

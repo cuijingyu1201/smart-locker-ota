@@ -9,6 +9,8 @@
 #include <string.h>
 #include "mqtt_client.h"   /*  MQTT 协议层 */
 #include "ota_manager.h"   /*  OTA 请求触发层 */
+#include "cabinet_fsm.h"
+#include "app_sensor.h"
 
 /* ==================== 可配置参数 ==================== */
 #define ESP_WIFI_SSID       "cai"        /*  2.4G WiFi 名（不能是 5G！） */
@@ -16,14 +18,15 @@
 #define ESP_TCP_SERVER_IP   "broker.emqx.io"         /* 改成电脑在同一个 WiFi 的 IPv4 地址 */
 #define ESP_TCP_SERVER_PORT 1883                      /* NetAssist 开的 TCP Server 端口 */
 #define MQTT_CLIENT_ID      "stm32_dev138"       /* Client ID，必须全局唯一！ */
-#define MQTT_TOPIC_SENSOR   "iot/dev001/sensor"  /* 上报温湿度的主题 */
-#define MQTT_TOPIC_OTA      "iot/dev001/ota"     /* 订阅OTA下行命令*/
+#define MQTT_TOPIC_STATUS   "iot/cab001/status"  /* 上行：柜态上报 */
+#define MQTT_TOPIC_ALERT    "iot/cab001/alert"   /* 上行：故障告警 */
+#define MQTT_TOPIC_CMD      "iot/cab001/cmd"     /* 下行：开柜命令（订阅） */
 
 /* ==================== 内部辅助函数声明 ==================== */
 static int  ESP8266_SendRaw(const char *data, uint16_t len);
 static int  ESP8266_SendAT(const char *cmd, const char *expect_ack, uint32_t timeout_ms);
-//static void ESP8266_SendJSON_Report(void);
-static void MQTT_PublishSensor(void);   /* MQTT PUBLISH 发温湿度 */
+static void MQTT_PublishSensor(void);                              /* MQTT PUBLISH 发温湿度 */\
+static void MQTT_PublishAlert(const char *type, const char *msg);  /* MQTT PUBLISH 发告警 */
 
 /* ================================================================
  * TaskESP8266：WiFi + TCP 状态机任务（优先级 24，栈 512 words）
@@ -37,6 +40,7 @@ void TaskESP8266(void *argument)
     static uint32_t enter_state_tick = 0;      /* 进入当前状态的时间戳（超时判断） */
 		static uint32_t last_ping_tick = 0;        /* 上次发PINGREQ的时间戳 */
 		static uint8_t  mqtt_first_connect = 1;    /* 1=首次连接 0=重连 */
+	  static uint32_t reconnect_backoff_ms = 1000; /* reconnect backoff: 1->2->4->8->30->60s */
     /* This state machine has one owner; large work buffers live in BSS, not PSP. */
     static char line[256];                     /* 接收行缓冲 */
 
@@ -345,7 +349,7 @@ void TaskESP8266(void *argument)
 
             /* 1. 拼 SUBSCRIBE 报文 */
             pkt_len = MQTT_BuildSubscribe(mqtt_buf, sizeof(mqtt_buf),
-                                          MQTT_TOPIC_OTA, 0);
+                                          MQTT_TOPIC_CMD, 0);
             if (pkt_len < 0) {
                 uart_printf_mutex("[MQTT] BuildSubscribe FAIL!\r\n");
                 state = ESP_STATE_RECONNECT;
@@ -368,7 +372,7 @@ void TaskESP8266(void *argument)
                 osMutexRelease(g_mqtt_mutex_handle);
             }
 
-            uart_printf_mutex("[MQTT] TX SUBSCRIBE %s (%d bytes)\r\n", MQTT_TOPIC_OTA, pkt_len);
+            uart_printf_mutex("[MQTT] TX SUBSCRIBE %s (%d bytes)\r\n", MQTT_TOPIC_CMD, pkt_len);
 
             /* 3. 等 2 秒让 SUBACK 回来（D6 不严格解析 SUBACK，发了就行） */
             osDelay(2000);
@@ -376,6 +380,7 @@ void TaskESP8266(void *argument)
             /* 4. 进入 MQTT_WORKING，初始化两个时间戳 */
             state = ESP_STATE_MQTT_WORKING;
             retry_cnt = 0;
+            reconnect_backoff_ms = 1000;   /* connected OK, reset backoff */
             enter_state_tick = osKernelGetTickCount();
             last_send_tick = osKernelGetTickCount();
             last_ping_tick = osKernelGetTickCount();
@@ -383,10 +388,34 @@ void TaskESP8266(void *argument)
             break;
         }
 
-               /* ---------------------------------------------------------------------
+        /* ---------------------------------------------------------------------
          * 状态 8：MQTT_WORKING → 5秒PUBLISH + 30秒PINGREQ + 检测掉线
          * --------------------------------------------------------------------- */
         case ESP_STATE_MQTT_WORKING: {
+					  /* ---- 第零件事：检测 FAULT 跳变，触发告警上报 ---- */
+            {
+                static cabinet_state_e last_alert_state = CAB_STATE_CLOSED;
+                cabinet_state_e cur_state = Cabinet_FSM_GetState();
+                if (cur_state == CAB_STATE_FAULT &&
+                    last_alert_state != CAB_STATE_FAULT) {
+                    fault_reason_e reason = Cabinet_FSM_GetFaultReason();
+                    const char *type = "unknown";
+                    const char *msg  = "fault";
+                    switch (reason) {
+                        case FAULT_OPENING_TIMEOUT:
+                            type = "fault_lock"; msg = "lock_stuck"; break;
+                        case FAULT_PICKUP_TIMEOUT:
+                            type = "timeout";    msg = "pickup_timeout";      break;
+                        case FAULT_CLOSING_TIMEOUT:
+                            type = "fault_door"; msg = "door_not_closed";      break;
+                        case FAULT_SENSOR_ABNORMAL:
+                            type = "sensor";      msg = "sensor_abnormal";    break;
+                        default: break;
+                    }
+                    MQTT_PublishAlert(type, msg);
+                }
+                last_alert_state = cur_state;
+            }
 
             /* ---- 第一件事：检查下行数据 / 掉线 / 下行PUBLISH（每 50ms）---- */
             if (g_esp_rx_sem_handle != NULL &&
@@ -515,6 +544,17 @@ void TaskESP8266(void *argument)
                                                 uart_printf_mutex("[MQTT] OTA cmd parse FAIL (size/crc missing)\r\n");
                                             }
                                         }
+																			    /* D20: 远程开柜命令 */
+                                        else if (strstr(json_buf, "\"cmd\":\"open\"") != NULL) {
+                                            cabinet_state_e cur = Cabinet_FSM_GetState();
+                                            if (cur == CAB_STATE_CLOSED) {
+                                                Cabinet_FSM_OpenRequest();
+                                                uart_printf_mutex("[MQTT] CMD: OPEN cabinet (accepted)\r\n");
+                                            } else {
+                                                uart_printf_mutex("[MQTT] CMD: OPEN rejected (state=%s)\r\n",
+                                                               Cabinet_FSM_StateStr(cur));
+                                            }
+                                        }	
                                     }
                                 }
                             } else {
@@ -560,12 +600,29 @@ void TaskESP8266(void *argument)
         /* ---------------------------------------------------------------------
          * 状态 9：RECONNECT → 等 3 秒从头再来
          * --------------------------------------------------------------------- */
-        case ESP_STATE_RECONNECT:
-            uart_printf_mutex("[ESP8266] ! RECONNECT in 3s...\r\n");
-            osDelay(3000);
+       case ESP_STATE_RECONNECT: {
+            /* Exponential backoff: 1->2->4->8->30->60s, +-10% jitter */
+            uint32_t jitter   = reconnect_backoff_ms / 10U;   /* 10% jitter */
+            uint32_t delay_ms = reconnect_backoff_ms
+                              + (osKernelGetTickCount() % (jitter + 1U));
+            uart_printf_mutex("[ESP8266] RECONNECT in %lus (backoff base=%lums)...\r\n",
+                            (unsigned long)(delay_ms / 1000U),
+                            (unsigned long)reconnect_backoff_ms);
+            osDelay(delay_ms);
+
+            /* step up backoff: 1->2->4->8->30->60, cap at 60s */
+            if (reconnect_backoff_ms < 8000U) {
+                reconnect_backoff_ms *= 2U;        /* 1->2->4->8 */
+            } else if (reconnect_backoff_ms < 30000U) {
+                reconnect_backoff_ms = 30000U;     /* 8->30 */
+            } else {
+                reconnect_backoff_ms = 60000U;     /* 30->60 cap */
+            }
+
             state = ESP_STATE_INIT;
             enter_state_tick = osKernelGetTickCount();
             break;
+        }
 
         default:
             state = ESP_STATE_INIT;
@@ -587,51 +644,6 @@ static int ESP8266_SendRaw(const char *data, uint16_t len)
     }
     return 0;
 }
-
-///* ================================================================
-// * 辅助函数：ESP8266_SendJSON_Report
-// *   读取 g_dht11_data → 拼 JSON → CIPSEND 报长 → 发 payload
-// * ================================================================ */
-//static void ESP8266_SendJSON_Report(void)
-//{
-//    char json_buf[128];
-//    char at_cmd[64];
-//    int json_len;
-//    DHT11_Data_t local;
-
-//    /* 1. 拿互斥锁拷出 DHT11 数据（防止 TaskDHT11 正在写） */
-//    if (g_dht11_mutex_handle != NULL) {
-//        osMutexAcquire(g_dht11_mutex_handle, 100);
-//    }
-//    local = g_dht11_data;
-//    if (g_dht11_mutex_handle != NULL) {
-//        osMutexRelease(g_dht11_mutex_handle);
-//    }
-
-//    /* 2. 拼 JSON 字符串（加个 tick，方便你看是不是新数据） */
-//    json_len = snprintf(json_buf, sizeof(json_buf),
-//                        "{\"temp\":%u,\"humi\":%u,\"tick\":%lu,\"uptime\":%lu}\r\n",
-//                        (unsigned)local.temp_int,
-//                        (unsigned)local.humi_int,
-//                        osKernelGetTickCount(),
-//                        osKernelGetTickCount() / 1000);
-//    if (json_len <= 0 || json_len >= (int)sizeof(json_buf)) return;
-
-//    uart_printf_mutex("[ESP8266] TX JSON: %s", json_buf);
-
-//    /* 3. 先告诉 ESP8266 要发多少字节：AT+CIPSEND=长度 */
-//    snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", json_len);
-//    ESP8266_SendRaw(at_cmd, strlen(at_cmd));
-
-//    /* 4. 等 ">" 提示符（ESP8266 回复 > 就可以发 payload），这里简单用 200ms 延时兜底
-//     *    （更严谨做法是等信号量收到">"再发，初期演示用延时够了） */
-//    osDelay(200);
-
-//    /* 5. 发 JSON payload */
-//    ESP8266_SendRaw(json_buf, (uint16_t)json_len);
-
-//    /* 6. 发完后等 "SEND OK" 确认的逻辑暂时不加，后面 D5 OTA 再严谨 */
-//}
 
 /* ================================================================
  *   函数：MQTT_PublishSensor
@@ -659,23 +671,28 @@ static void MQTT_PublishSensor(void)
         local = g_dht11_data;   /* 锁超时也读，最多读到半新半旧 */
     }
 
-    /* 2. 拼 JSON（注意：D6 不加 \r\n！MQTT payload 长度必须精确） */
-    json_len = snprintf(json_buf, sizeof(json_buf),
-                        "{\"temp\":%u,\"humi\":%u,\"tick\":%lu,\"uptime\":%lu}",
-                        (unsigned)local.temp_int,
-                        (unsigned)local.humi_int,
-                        osKernelGetTickCount(),
-                        osKernelGetTickCount() / 1000);
+    /* 读取柜态：门状态 + 物品状态 */
+		cabinet_state_e cab_state = Cabinet_FSM_GetState();
+		item_state_e    item_state = App_Sensor_GetItem();
+		const char *door_str = (cab_state == CAB_STATE_CLOSED) ? "closed" :
+													 (cab_state == CAB_STATE_FAULT)  ? "fault"  : "open";
+		const char *item_str = (item_state == ITEM_PRESENT) ? "yes" : "no";
+
+		json_len = snprintf(json_buf, sizeof(json_buf),
+												"{\"door\":\"%s\",\"item\":\"%s\",\"temp\":%u,\"humi\":%u,\"uptime\":%u}",
+												door_str, item_str,
+												(unsigned)local.temp_int,
+												(unsigned)local.humi_int,
+												osKernelGetTickCount() / 1000);
     if (json_len <= 0 || json_len >= (int)sizeof(json_buf)) return;
 
     /* 3. 把 JSON 包装成完整的 MQTT PUBLISH 报文 */
     mqtt_len = MQTT_BuildPublish(mqtt_buf, sizeof(mqtt_buf),
-                                 MQTT_TOPIC_SENSOR,
-                                 (uint8_t *)json_buf, json_len);
+                             MQTT_TOPIC_STATUS,
+                             (uint8_t *)json_buf, json_len);
     if (mqtt_len < 0) return;
 
-    uart_printf_mutex("[MQTT] TX PUBLISH %s (%d bytes)\r\n", MQTT_TOPIC_SENSOR, mqtt_len);
-
+		uart_printf_mutex("[MQTT] TX PUBLISH %s (%d bytes)\r\n", MQTT_TOPIC_STATUS, mqtt_len);
     /* 4. 用 AT+CIPSEND 把 MQTT 报文通过 TCP 发给 Broker
      *    D7改：锁放在函数内部，调用者（5秒定时 / report强制上报）都不用关心锁 */
     if (g_mqtt_mutex_handle != NULL) {
@@ -684,6 +701,46 @@ static void MQTT_PublishSensor(void)
     snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", mqtt_len);
     ESP8266_SendRaw(at_cmd, strlen(at_cmd));
     osDelay(200);   /* 等 > 提示符 */
+    ESP8266_SendRaw((char *)mqtt_buf, (uint16_t)mqtt_len);
+    if (g_mqtt_mutex_handle != NULL) {
+        osMutexRelease(g_mqtt_mutex_handle);
+    }
+}
+
+/* ================================================================
+ * 函数：MQTT_PublishAlert
+ *   上报故障告警到 iot/cab001/alert
+ *   参数：type = 故障类型字符串（英文短名，给云端程序判）
+ *         msg  = 故障描述（给人看）
+ *   调用时机：状态机进 FAULT 时，由 MQTT_WORKING 态轮询跳变触发
+ * ================================================================ */
+static void MQTT_PublishAlert(const char *type, const char *msg)
+{
+    static uint8_t mqtt_buf[256];
+    static char json_buf[128];
+    static char at_cmd[32];
+    int json_len, mqtt_len;
+
+    /* 1. 拼告警 JSON */
+    json_len = snprintf(json_buf, sizeof(json_buf),
+                        "{\"type\":\"%s\",\"msg\":\"%s\"}", type, msg);
+    if (json_len <= 0 || json_len >= (int)sizeof(json_buf)) return;
+
+    /* 2. 包装成 MQTT PUBLISH 报文 */
+    mqtt_len = MQTT_BuildPublish(mqtt_buf, sizeof(mqtt_buf),
+                                 MQTT_TOPIC_ALERT,
+                                 (uint8_t *)json_buf, json_len);
+    if (mqtt_len < 0) return;
+
+    uart_printf_mutex("[MQTT] TX ALERT %s type=%s\r\n", MQTT_TOPIC_ALERT, type);
+
+    /* 3. AT+CIPSEND 发出 */
+    if (g_mqtt_mutex_handle != NULL) {
+        osMutexAcquire(g_mqtt_mutex_handle, osWaitForever);
+    }
+    snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", mqtt_len);
+    ESP8266_SendRaw(at_cmd, strlen(at_cmd));
+    osDelay(200);
     ESP8266_SendRaw((char *)mqtt_buf, (uint16_t)mqtt_len);
     if (g_mqtt_mutex_handle != NULL) {
         osMutexRelease(g_mqtt_mutex_handle);
