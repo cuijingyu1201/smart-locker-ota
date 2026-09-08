@@ -27,7 +27,7 @@
 #include "jump_to_app.h"
 #include <stdio.h>
 #include "flash_param.h" 
-#include "iap.h"    /* IAP_ProcessSerial ???? Ymodem ???? */
+#include "iap.h"    
 #include "boot_ota.h"   /*  WiFi_IAP_Init / WiFi_IAP_Process */
 
 /* USER CODE END Includes */

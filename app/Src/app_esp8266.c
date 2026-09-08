@@ -25,8 +25,9 @@
 /* ==================== 内部辅助函数声明 ==================== */
 static int  ESP8266_SendRaw(const char *data, uint16_t len);
 static int  ESP8266_SendAT(const char *cmd, const char *expect_ack, uint32_t timeout_ms);
-static void MQTT_PublishSensor(void);                              /* MQTT PUBLISH 发温湿度 */\
-static void MQTT_PublishAlert(const char *type, const char *msg);  /* MQTT PUBLISH 发告警 */
+static int  MQTT_PublishSensor(void);                              /* MQTT PUBLISH 发温湿度 */\
+static int  MQTT_PublishAlert(const char *type, const char *msg); /* MQTT PUBLISH 发告警 */
+static int  ESP8266_SendMqttPacket(const uint8_t *data, uint16_t len);
 
 /* ================================================================
  * TaskESP8266：WiFi + TCP 状态机任务（优先级 24，栈 512 words）
@@ -35,14 +36,15 @@ void TaskESP8266(void *argument)
 {
     (void)argument;
     static ESP8266_State_t state = ESP_STATE_INIT;
-    static uint8_t retry_cnt = 0;              /* 单状态重试次数 */
-    static uint32_t last_send_tick = 0;        /* 上次 TCP 上报时间戳（WORKING 用） */
-    static uint32_t enter_state_tick = 0;      /* 进入当前状态的时间戳（超时判断） */
-		static uint32_t last_ping_tick = 0;        /* 上次发PINGREQ的时间戳 */
-		static uint8_t  mqtt_first_connect = 1;    /* 1=首次连接 0=重连 */
-	  static uint32_t reconnect_backoff_ms = 1000; /* reconnect backoff: 1->2->4->8->30->60s */
-    /* This state machine has one owner; large work buffers live in BSS, not PSP. */
-    static char line[256];                     /* 接收行缓冲 */
+    static uint8_t retry_cnt = 0;                 /* 单状态重试次数 */
+    static uint32_t last_send_tick = 0;           /* 上次 TCP 上报时间戳（WORKING 用） */
+    static uint32_t enter_state_tick = 0;         /* 进入当前状态的时间戳（超时判断） */
+		static uint32_t last_ping_tick = 0;           /* 上次发PINGREQ的时间戳 */
+  	static uint8_t  ping_pending = 0;             /*  1=已发PINGREQ未收PINGRESP */
+		static uint32_t ping_send_tick = 0;           /* PINGREQ 发送时间戳 */
+		static uint8_t  mqtt_first_connect = 1;       /* 1=首次连接 0=重连 */
+	  static uint32_t reconnect_backoff_ms = 1000;  /* reconnect backoff: 1->2->4->8->30->60s */
+    static char line[512];                        /* 接收行缓冲 */
 
 		/* 等待 ESP8266-12F 模块启动完成（冷启动需要 2-3 秒） */
     uart_printf_mutex("[ESP8266] Waiting for module boot (3s)...\r\n");
@@ -283,21 +285,19 @@ void TaskESP8266(void *argument)
                 break;
             }
 
-            /*  发 AT+CIPSEND 前拿互斥锁，防止和 PUBLISH/PINGREQ 冲突 */
+            /* 发 AT+CIPSEND 前拿互斥锁，防止和 PUBLISH/PINGREQ 冲突 */
             if (g_mqtt_mutex_handle != NULL) {
                 osMutexAcquire(g_mqtt_mutex_handle, osWaitForever);
             }
-						/* ───────── 以下是【发送报文】的完整步骤 ───────── */
-            {
-                static char at_cmd[32];
-                snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", pkt_len);
-                ESP8266_SendRaw(at_cmd, strlen(at_cmd));
-                osDelay(200);   /* 等 > 提示符 */
-                ESP8266_SendRaw((char *)mqtt_buf, (uint16_t)pkt_len);
-            }
-						/* ───────── 发送结束 ───────── */
+            int send_ret = ESP8266_SendMqttPacket(mqtt_buf, (uint16_t)pkt_len);
             if (g_mqtt_mutex_handle != NULL) {
                 osMutexRelease(g_mqtt_mutex_handle);
+            }
+            if (send_ret != 0) {
+                uart_printf_mutex("[MQTT] CONNECT send FAIL, RECONNECT\r\n");
+                state = ESP_STATE_RECONNECT;
+                enter_state_tick = now;
+                break;
             }
 
             uart_printf_mutex("[MQTT] TX CONNECT (%d bytes)\r\n", pkt_len);
@@ -333,6 +333,11 @@ void TaskESP8266(void *argument)
                     uart_printf_mutex("[MQTT] CONNACK timeout!  RECONNECT\r\n");
                     state = ESP_STATE_RECONNECT;
                     enter_state_tick = now;
+                } else {
+                    /* P1-2 改进：retry_cnt < 3 时下轮循环会重发 CONNECT 报文
+                     * 原代码这里没有日志，看起来像卡死，实际是在重试
+                     * 加日志让重试过程可见，便于调试 */
+                    uart_printf_mutex("[MQTT] CONNACK timeout, will retry (%d/3)\r\n", retry_cnt);
                 }
             }
             break;
@@ -357,19 +362,19 @@ void TaskESP8266(void *argument)
                 break;
             }
 
-            /* 2. 发出去 */
+            /* 2. 发出去（带结果检查） */
             if (g_mqtt_mutex_handle != NULL) {
                 osMutexAcquire(g_mqtt_mutex_handle, osWaitForever);
             }
-            {
-                static char at_cmd[32];
-                snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", pkt_len);
-                ESP8266_SendRaw(at_cmd, strlen(at_cmd));
-                osDelay(200);
-                ESP8266_SendRaw((char *)mqtt_buf, (uint16_t)pkt_len);
-            }
+            int send_ret = ESP8266_SendMqttPacket(mqtt_buf, (uint16_t)pkt_len);
             if (g_mqtt_mutex_handle != NULL) {
                 osMutexRelease(g_mqtt_mutex_handle);
+            }
+            if (send_ret != 0) {
+                uart_printf_mutex("[MQTT] SUBSCRIBE send FAIL, RECONNECT\r\n");
+                state = ESP_STATE_RECONNECT;
+                enter_state_tick = now;
+                break;
             }
 
             uart_printf_mutex("[MQTT] TX SUBSCRIBE %s (%d bytes)\r\n", MQTT_TOPIC_CMD, pkt_len);
@@ -412,7 +417,11 @@ void TaskESP8266(void *argument)
                             type = "sensor";      msg = "sensor_abnormal";    break;
                         default: break;
                     }
-                    MQTT_PublishAlert(type, msg);
+                    if (MQTT_PublishAlert(type, msg) != 0) {
+                        state = ESP_STATE_RECONNECT;
+                        enter_state_tick = osKernelGetTickCount();
+                        break;
+                    }
                 }
                 last_alert_state = cur_state;
             }
@@ -430,20 +439,38 @@ void TaskESP8266(void *argument)
                     }
                     uart_printf_mutex("\r\n");
 
-                    /* (2) 掉线检测 */
-                    if (strstr(line, "WIFI DISCONNECT") != NULL ||
-                        strstr(line, "CLOSED") != NULL) {
-                        uart_printf_mutex("[MQTT] Connection lost!  RECONNECT\r\n");
-                        state = ESP_STATE_RECONNECT;
-                        enter_state_tick = now;
-                        break;
+                    /* (2) 掉线检测（排除 +IPD 数据帧 + 二进制乱码，防止误判） */
+                    if (strstr(line, "+IPD") == NULL) {
+                        /* P2 修复：先判断是否为可打印文本，二进制乱码不参与掉线判定
+                         * ESP8266 重启吐 boot logo 是二进制流，随机字节可能拼出 "ready" 等关键字，
+                         * 用 80% 可打印比例阈值过滤，避免误触发重连 */
+                        int printable = 0;
+                        for (int j = 0; j < rlen; j++) {
+                            uint8_t c = (uint8_t)line[j];
+                            if (c == '\r' || c == '\n' || (c >= 0x20 && c <= 0x7E)) printable++;
+                        }
+                        int is_text = (rlen > 0 && (printable * 100 / rlen) >= 80);
+
+                        if (is_text) {
+                            if (strstr(line, "WIFI DISCONNECT") != NULL ||
+                                strstr(line, "CLOSED") != NULL ||
+                                strstr(line, "ERROR") != NULL ||
+                                strstr(line, "WIFI GOT IP") != NULL ||
+                                strstr(line, "ready") != NULL ||
+                                strstr(line, "busy p") != NULL) {
+                                uart_printf_mutex("[MQTT] Link abnormal, RECONNECT\r\n");
+                                state = ESP_STATE_RECONNECT;
+                                enter_state_tick = now;
+                                break;
+                            }
+                        }
                     }
                     /* (3) 解析下行 PUBLISH（Broker->板子）
                      *   D11 修复：ESP8266 +IPD 数据可能分多次 RX 到达，
                      *   必须跨 RX 累积到完整帧再解析，否则分包时解析出错 */
                     {
                         /* 静态累积缓冲区 + 状态变量（跨 RX 调用保持）*/
-                        static uint8_t mqtt_accum[256];     /* MQTT 帧累积缓冲区 */
+                        static uint8_t mqtt_accum[512];     /* P2 扩容：256->512，与 line 对齐，支持长报文 */
                         static int     mqtt_accum_len = 0;   /* 已累积字节数 */
                         static int     mqtt_expected  = 0;   /* +IPD 声明的总长度，0=没在收 */
 
@@ -511,7 +538,7 @@ void TaskESP8266(void *argument)
 
                                     /* 拷到局部 buf 加 \0 */
                                     if (payload != NULL && payload_len > 0) {
-                                        static char json_buf[192];
+                                        static char json_buf[384];          /* P2 扩容：192->384，与 mqtt_accum 配套，支持长 JSON 命令 */
                                         int cp_len = (payload_len < (int)(sizeof(json_buf)-1))
                                                      ? payload_len : (int)(sizeof(json_buf)-1);
                                         memcpy(json_buf, payload, cp_len);
@@ -557,6 +584,36 @@ void TaskESP8266(void *argument)
                                         }	
                                     }
                                 }
+                            } else if (pkt_type == 0xD0) {
+                                /* PINGRESP，心跳回复正常 */
+                                if (ping_pending) {
+                                    uart_printf_mutex("[MQTT] RX PINGRESP OK\r\n");
+                                }
+                                ping_pending = 0;
+                            } else if (pkt_type == 0x90) {
+                                /* P1 新增：SUBACK 解析，检查订阅是否成功
+                                 * SUBACK 格式：0x90 + 剩余长度(1B=3) + 报文ID(2B) + 返回码(1B)
+                                 *   返回码：0x00=QoS0接受 0x01=QoS1接受 0x02=QoS2接受 0x80=失败
+                                 * SUBSCRIBE 报文ID 是 0x00 0x01，SUBACK 应回相同 ID */
+                                if (mqtt_len >= 5) {
+                                    uint8_t suback_id_msb = mqtt_data[2];
+                                    uint8_t suback_id_lsb = mqtt_data[3];
+                                    uint8_t return_code  = mqtt_data[4];
+                                    if (suback_id_msb == 0x00 && suback_id_lsb == 0x01 &&
+                                        return_code != 0x80) {
+                                        uart_printf_mutex("[MQTT] SUBACK success (QoS granted=%u)\r\n",
+                                               (unsigned)return_code);
+                                    } else if (return_code == 0x80) {
+                                        uart_printf_mutex("[MQTT] SUBACK FAIL (subscribe rejected), RECONNECT\r\n");
+                                        state = ESP_STATE_RECONNECT;
+                                        enter_state_tick = osKernelGetTickCount();
+                                    } else {
+                                        uart_printf_mutex("[MQTT] SUBACK ID mismatch (got %02X%02X)\r\n",
+                                               suback_id_msb, suback_id_lsb);
+                                    }
+                                } else {
+                                    uart_printf_mutex("[MQTT] SUBACK malformed (len=%d)\r\n", mqtt_len);
+                                }
                             } else {
                                 uart_printf_mutex("[MQTT] Skip non-PUBLISH packet (type=0x%02X)\r\n", pkt_type);
                             }
@@ -572,25 +629,41 @@ void TaskESP8266(void *argument)
 
             /* ---- 第二件事：每 5 秒发一次温湿度 PUBLISH ---- */
             if ((now - last_send_tick) >= 5000) {
-                MQTT_PublishSensor();
+                if (MQTT_PublishSensor() != 0) {
+                    state = ESP_STATE_RECONNECT;
+                    enter_state_tick = osKernelGetTickCount();
+                    break;
+                }
                 last_send_tick = now;
             }
 
             /* ---- 第三件事：每 30 秒发一次 PINGREQ 心跳 ---- */
+            /*  先检查上次 PINGREQ 是否超时未收 PINGRESP */
+            if (ping_pending && (now - ping_send_tick) >= 15000) {
+                uart_printf_mutex("[MQTT] PINGRESP timeout, link dead, RECONNECT\r\n");
+                state = ESP_STATE_RECONNECT;
+                enter_state_tick = osKernelGetTickCount();
+                break;
+            }
             if ((now - last_ping_tick) >= 30000) {
                 uint8_t ping_buf[4];
                 int ping_len = MQTT_BuildPingreq(ping_buf, sizeof(ping_buf));
-                static char at_cmd[32];
-                snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", ping_len);
                 if (g_mqtt_mutex_handle != NULL) {
                     osMutexAcquire(g_mqtt_mutex_handle, osWaitForever);
                 }
-                ESP8266_SendRaw(at_cmd, strlen(at_cmd));
-                osDelay(200);
-                ESP8266_SendRaw((char *)ping_buf, (uint16_t)ping_len);
+                int send_ret = ESP8266_SendMqttPacket(ping_buf, (uint16_t)ping_len);
                 if (g_mqtt_mutex_handle != NULL) {
                     osMutexRelease(g_mqtt_mutex_handle);
                 }
+                if (send_ret != 0) {
+                    uart_printf_mutex("[MQTT] PINGREQ send FAIL, RECONNECT\r\n");
+                    state = ESP_STATE_RECONNECT;
+                    enter_state_tick = osKernelGetTickCount();
+                    break;
+                }
+                /*  标记已发 PINGREQ，等 PINGRESP */
+                ping_pending = 1;
+                ping_send_tick = now;
                 uart_printf_mutex("[MQTT] TX PINGREQ (%d bytes)\r\n", ping_len);
                 last_ping_tick = now;
             }
@@ -619,6 +692,7 @@ void TaskESP8266(void *argument)
                 reconnect_backoff_ms = 60000U;     /* 30->60 cap */
             }
 
+						ping_pending = 0;            /* 重连时清 PING 状态，避免重连后误判超时 */
             state = ESP_STATE_INIT;
             enter_state_tick = osKernelGetTickCount();
             break;
@@ -646,6 +720,70 @@ static int ESP8266_SendRaw(const char *data, uint16_t len)
 }
 
 /* ================================================================
+ * ESP8266_SendMqttPacket：带结果检查的 MQTT 报文发送
+ *   完整四步：AT+CIPSEND → 等 ">" → 发数据 → 等 "SEND OK"
+ *   返回：0=成功，-1=失败（调用者应触发重连）
+ * ================================================================ */
+static int ESP8266_SendMqttPacket(const uint8_t *data, uint16_t len)
+{
+    char at_cmd[32];
+    char resp[64];
+    int got_prompt = 0;
+    int got_send_ok = 0;
+    uint32_t wait_start;
+
+    /* 第 1 步：发 AT+CIPSEND=len */
+    snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", len);
+    ESP8266_SendRaw(at_cmd, strlen(at_cmd));
+
+    /* 第 2 步：等 ">" 提示符（最长 1 秒） */
+    wait_start = osKernelGetTickCount();
+    while ((osKernelGetTickCount() - wait_start) < 1000) {
+        if (ESP8266_GetLine(resp, sizeof(resp)) > 0) {
+            if (strchr(resp, '>') != NULL) {
+                got_prompt = 1;
+                break;
+            }
+            /* 如果回复 ERROR，说明连接已断 */
+            if (strstr(resp, "ERROR") != NULL) {
+                uart_printf_mutex("[MQTT] CIPSEND ERROR (link down?)\r\n");
+                return -1;
+            }
+        }
+        osDelay(20);
+    }
+    if (!got_prompt) {
+        uart_printf_mutex("[MQTT] CIPSEND no '>' prompt, timeout\r\n");
+        return -1;
+    }
+
+    /* 第 3 步：发 MQTT 数据 */
+    ESP8266_SendRaw((const char *)data, len);
+
+    /* 第 4 步：等 "SEND OK"（最长 1 秒） */
+    wait_start = osKernelGetTickCount();
+    while ((osKernelGetTickCount() - wait_start) < 1000) {
+        if (ESP8266_GetLine(resp, sizeof(resp)) > 0) {
+            if (strstr(resp, "SEND OK") != NULL) {
+                got_send_ok = 1;
+                break;
+            }
+            if (strstr(resp, "ERROR") != NULL || strstr(resp, "FAIL") != NULL) {
+                uart_printf_mutex("[MQTT] SEND FAIL/ERROR\r\n");
+                return -1;
+            }
+        }
+        osDelay(20);
+    }
+    if (!got_send_ok) {
+        uart_printf_mutex("[MQTT] no SEND OK, timeout\r\n");
+        return -1;
+    }
+
+    return 0;   /* 全部成功 */
+}
+
+/* ================================================================
  *   函数：MQTT_PublishSensor
  *   读 DHT11 → 拼 JSON → 拼成 MQTT PUBLISH 报文 → AT+CIPSEND 发出
  *
@@ -654,11 +792,10 @@ static int ESP8266_SendRaw(const char *data, uint16_t len)
  *     D6：AT+CIPSEND 发的是完整 MQTT PUBLISH 报文（固定头+主题+JSON）
  *         Broker 收到后能按 MQTT 协议解析，转发给所有订阅者
  * ================================================================ */
-static void MQTT_PublishSensor(void)
+static int MQTT_PublishSensor(void)
 {
     static uint8_t mqtt_buf[256]; /* MQTT 完整报文缓冲 */
     static char json_buf[128];    /* JSON 载荷缓冲 */
-    static char at_cmd[32];       /* AT+CIPSEND 指令缓冲 */
     int json_len, mqtt_len;
     DHT11_Data_t local;
 
@@ -684,27 +821,28 @@ static void MQTT_PublishSensor(void)
 												(unsigned)local.temp_int,
 												(unsigned)local.humi_int,
 												osKernelGetTickCount() / 1000);
-    if (json_len <= 0 || json_len >= (int)sizeof(json_buf)) return;
+    if (json_len <= 0 || json_len >= (int)sizeof(json_buf)) return -1;
 
     /* 3. 把 JSON 包装成完整的 MQTT PUBLISH 报文 */
     mqtt_len = MQTT_BuildPublish(mqtt_buf, sizeof(mqtt_buf),
                              MQTT_TOPIC_STATUS,
                              (uint8_t *)json_buf, json_len);
-    if (mqtt_len < 0) return;
+    if (mqtt_len < 0) return -1;
 
 		uart_printf_mutex("[MQTT] TX PUBLISH %s (%d bytes)\r\n", MQTT_TOPIC_STATUS, mqtt_len);
-    /* 4. 用 AT+CIPSEND 把 MQTT 报文通过 TCP 发给 Broker
-     *    D7改：锁放在函数内部，调用者（5秒定时 / report强制上报）都不用关心锁 */
+    /* 4. 用 AT+CIPSEND 把 MQTT 报文通过 TCP 发给 Broker */
     if (g_mqtt_mutex_handle != NULL) {
         osMutexAcquire(g_mqtt_mutex_handle, osWaitForever);
     }
-    snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", mqtt_len);
-    ESP8266_SendRaw(at_cmd, strlen(at_cmd));
-    osDelay(200);   /* 等 > 提示符 */
-    ESP8266_SendRaw((char *)mqtt_buf, (uint16_t)mqtt_len);
+    int send_ret = ESP8266_SendMqttPacket(mqtt_buf, (uint16_t)mqtt_len);
     if (g_mqtt_mutex_handle != NULL) {
         osMutexRelease(g_mqtt_mutex_handle);
     }
+    if (send_ret != 0) {
+        uart_printf_mutex("[MQTT] PUBLISH send FAIL, will reconnect\r\n");
+        return -1;   /* 失败，由调用者触发重连 */
+    }
+    return 0;   /* 发送成功 */
 }
 
 /* ================================================================
@@ -714,37 +852,34 @@ static void MQTT_PublishSensor(void)
  *         msg  = 故障描述（给人看）
  *   调用时机：状态机进 FAULT 时，由 MQTT_WORKING 态轮询跳变触发
  * ================================================================ */
-static void MQTT_PublishAlert(const char *type, const char *msg)
+static int MQTT_PublishAlert(const char *type, const char *msg)
 {
     static uint8_t mqtt_buf[256];
     static char json_buf[128];
-    static char at_cmd[32];
     int json_len, mqtt_len;
 
     /* 1. 拼告警 JSON */
     json_len = snprintf(json_buf, sizeof(json_buf),
                         "{\"type\":\"%s\",\"msg\":\"%s\"}", type, msg);
-    if (json_len <= 0 || json_len >= (int)sizeof(json_buf)) return;
+    if (json_len <= 0 || json_len >= (int)sizeof(json_buf)) return -1;
 
     /* 2. 包装成 MQTT PUBLISH 报文 */
     mqtt_len = MQTT_BuildPublish(mqtt_buf, sizeof(mqtt_buf),
                                  MQTT_TOPIC_ALERT,
                                  (uint8_t *)json_buf, json_len);
-    if (mqtt_len < 0) return;
+    if (mqtt_len < 0) return -1;
 
     uart_printf_mutex("[MQTT] TX ALERT %s type=%s\r\n", MQTT_TOPIC_ALERT, type);
 
-    /* 3. AT+CIPSEND 发出 */
+    /* 3. AT+CIPSEND 发出（带结果检查） */
     if (g_mqtt_mutex_handle != NULL) {
         osMutexAcquire(g_mqtt_mutex_handle, osWaitForever);
     }
-    snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", mqtt_len);
-    ESP8266_SendRaw(at_cmd, strlen(at_cmd));
-    osDelay(200);
-    ESP8266_SendRaw((char *)mqtt_buf, (uint16_t)mqtt_len);
+    int send_ret = ESP8266_SendMqttPacket(mqtt_buf, (uint16_t)mqtt_len);
     if (g_mqtt_mutex_handle != NULL) {
         osMutexRelease(g_mqtt_mutex_handle);
     }
+    return (send_ret == 0) ? 0 : -1;
 }
 
 /* （ESP8266_SendAT 这个函数后面调试时会用，状态机现在直接用 SendRaw 简化逻辑，保留占位） */

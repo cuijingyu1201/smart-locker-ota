@@ -2944,3 +2944,233 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 
 
 
+
+# D20之后的修复   MQTT 通信稳定性加固（2026-09-08）
+
+阶段归属：智能储物柜（1 柜极简触屏版）· 阶段6 通信稳定性 · MQTT 链路加固
+
+* 硬件：正点原子精英 STM32F103ZET6 + ESP8266-12F + EMQX 公共 Broker
+
+* 软件：FreeRTOS CMSIS_V2 + HAL 库 + 自实现 MQTT 3.1.1 协议层
+
+* 目标：解决 D20 投产后暴露的 MQTT 收发不稳、误重连、长报文丢失等问题，把"能收发但偶发异常"升级为"长时间稳定运行且异常可识别"。
+
+***
+
+## 坑1：AT+CIPSEND 只检查 SEND OK 不检查 ">" 提示符，MQTT 报文静默丢失（致命）
+
+* **现象**：MQTTX 偶发收不到硬件 PUBLISH 的温湿度数据；串口显示 `TX PUBLISH` 正常但 MQTTX 端无对应消息。
+
+* **根因**：原 `MQTT_PublishSensor` 直接 `AT+CIPSEND=len` + `ESP8266_SendRaw(data, len)` 两步走，只发不等。问题链：
+  1. `AT+CIPSEND=len` 后 ESP8266 应回 `>` 提示符才表示准备好接收数据；
+  2. 若 TCP 链路已断，ESP8266 回 `ERROR` 而非 `>`，但代码没检查；
+  3. 直接把 MQTT 报文发过去，ESP8266 当作普通 AT 指令解析，报文被丢弃；
+  4. 代码也没等 `SEND OK`，发送是否真正成功无从得知。
+
+* **解决**：新增 `ESP8266_SendMqttPacket` 函数，完整四步带结果检查：
+
+  ```c
+  static int ESP8266_SendMqttPacket(const uint8_t *data, uint16_t len)
+  {
+      /* 第 1 步：发 AT+CIPSEND=len */
+      /* 第 2 步：等 ">" 提示符（最长 1 秒），收到 ERROR 立即返回失败 */
+      /* 第 3 步：发 MQTT 数据 */
+      /* 第 4 步：等 "SEND OK"（最长 1 秒），收到 ERROR/FAIL 立即返回失败 */
+      return got_send_ok ? 0 : -1;
+  }
+  ```
+
+  `MQTT_PublishSensor` / `MQTT_PublishAlert` / `MQTT_CONNECT` / `MQTT_SUBSCRIBE` / PINGREQ 全部改走该函数，发送失败由调用者触发 RECONNECT。
+
+* **教训**：AT 指令交互不能"发完就走"，尤其是 `AT+CIPSEND` 这种两段式命令（先 `>` 后数据），必须完整检查每一步的预期回复，否则链路异常时报文静默丢失，极难定位。
+
+***
+
+## 坑2：掉线检测用 strstr 在二进制流里找关键字，ESP8266 重启 boot logo 误触发重连（严重）
+
+* **现象**：按 ESP8266 RST 键后，串口出现 `[MQTT] Link abnormal, RECONNECT`，但实际是模块重启的正常 URC，不该走重连路径（虽然结果还是要重连，但误报"Link abnormal"干扰定位）。
+
+* **根因**：掉线检测代码：
+  ```c
+  if (strstr(line, "+IPD") == NULL) {
+      if (strstr(line, "WIFI DISCONNECT") != NULL ||
+          strstr(line, "ready") != NULL || ...)
+  }
+  ```
+  ESP8266 RST 后吐的 boot logo 是二进制流（287+268 字节随机字节），里面随机字节序列恰好拼出 `ready` / `ERROR` / `CLOSED` 等关键字的字节序列，`strstr` 在二进制数据里找子串命中，误判为掉线。
+
+* **解决**：掉线检测前先判断"是否为可打印文本"，二进制乱码不参与掉线判定：
+
+  ```c
+  int printable = 0;
+  for (int j = 0; j < rlen; j++) {
+      uint8_t c = (uint8_t)line[j];
+      if (c == '\r' || c == '\n' || (c >= 0x20 && c <= 0x7E)) printable++;
+  }
+  int is_text = (rlen > 0 && (printable * 100 / rlen) >= 80);
+
+  if (is_text) {
+      /* 才进入关键字匹配 */
+  }
+  ```
+
+  用 80% 可打印比例阈值过滤。真正的 URC（如 `WIFI DISCONNECT\r\n`）100% 可打印能通过，纯二进制 boot logo 可打印比例约 38% 被挡掉。
+
+* **教训**：`strstr` 在二进制数据里找子串是高危操作，任何字节序列都可能凑出关键字。处理来自不可控源（UART/网络）的数据时，先做"是否为文本"的格式判断，再走字符串匹配，避免误判。
+
+***
+
+## 坑3：接收缓冲区 256 字节过小，ESP8266 长数据被截断丢失（严重）
+
+* **现象**：ESP8266 一次吐出 287+268=555 字节 boot logo，但 `line` 缓冲只有 256 字节，`esp_rx_buf` 底层缓冲 512 字节，数据被截断。
+
+* **根因**：
+  1. `TaskESP8266` 的 `static char line[256]` 容量小于底层 `esp_rx_buf[512]`，装不下完整数据；
+  2. 更严重的 bug 在 `ESP8266_GetLine`：
+     ```c
+     if (esp_rx_wr_idx >= max_len) esp_rx_wr_idx = max_len - 1;  /* 超长时截断 */
+     ```
+     直接改写 `esp_rx_wr_idx`（ISR 写指针），超过部分的数据记录被抹掉；ISR 下次写入时从这个被改小的指针继续写，可能覆盖还没被任务读走的数据。
+
+* **解决**：
+  1. `line[256]` 扩到 `line[512]`，与底层 `esp_rx_buf` 对齐，从源头消除截断；
+  2. `ESP8266_GetLine` 修复为"超长不丢数据"版本：超长时只取 `max_len-1` 字节，剩余数据 `memmove` 前移保留，下次调用继续取：
+     ```c
+     if (esp_rx_wr_idx < max_len) {
+         /* 小数据全部拷贝清空 */
+     } else {
+         /* 大数据只取 max_len-1，剩余 memmove 前移保留 */
+         memcpy(line, esp_rx_buf, max_len - 1);
+         line[max_len - 1] = '\0';
+         len = max_len - 1;
+         remain = esp_rx_wr_idx - (max_len - 1);
+         memmove(esp_rx_buf, esp_rx_buf + (max_len - 1), remain);
+         esp_rx_wr_idx = remain;
+     }
+     ```
+
+* **教训**：底层缓冲和上层缓冲容量必须对齐，否则上层装不下时数据要么丢要么被截断。`memmove` 保留剩余数据是环形缓冲的标准做法，不能简单"截断 + 改写指针"。
+
+***
+
+## 坑4：MQTT 帧累积缓冲 mqtt_accum[256] 装不下长 PUBLISH，整帧丢弃（严重）
+
+* **现象**：Broker 下发 300 字节以上的 PUBLISH 报文（长 JSON 命令）时，APP 收不到命令，串口无任何错误提示。
+
+* **根因**：`+IPD` 解析逻辑：
+  ```c
+  mqtt_expected = atoi(ipd_tag + 5);
+  if (mqtt_expected > 0 && mqtt_expected <= (int)sizeof(mqtt_accum)) {  /* 256 */
+      /* 累积 */
+  } else {
+      mqtt_expected = 0;       /* 直接丢弃整帧 */
+      mqtt_accum_len = 0;
+  }
+  ```
+  `mqtt_accum[256]` 容量不够时，整帧被静默丢弃。配套的 `json_buf[192]` 也会把超长 payload 截断到 191 字节，命令解析失败。
+
+* **解决**：
+  1. `mqtt_accum[256]` 扩到 `mqtt_accum[512]`，与 `line` 对齐；
+  2. `json_buf[192]` 扩到 `json_buf[384]`，与 `mqtt_accum` 配套。
+
+* **教训**：接收缓冲链路上每一层的容量都要对齐（ISR buf → line → mqtt_accum → json_buf），任何一层容量偏小都会成为瓶颈，导致数据丢失或截断。设计时按"最大单帧大小 + 余量"统一规划所有缓冲容量。
+
+***
+
+## 坑5：PINGREQ 只发不检查 PINGRESP，TCP 静默断开无法发现（严重）
+
+* **现象**：TCP 连接被 NAT 超时静默断开时（ESP8266 收不到 CLOSED URC），APP 永远不知道链路已死，继续发 PUBLISH 但 MQTTX 收不到，心跳机制形同虚设。
+
+* **根因**：原 PINGREQ 逻辑：
+  ```c
+  int send_ret = ESP8266_SendMqttPacket(ping_buf, ping_len);
+  if (send_ret != 0) { RECONNECT; }    /* 只检查 AT 指令是否成功 */
+  last_ping_tick = now;                 /* 发出去就视为成功 */
+  ```
+  `ESP8266_SendMqttPacket` 只验证 AT 指令层面（`SEND OK`），不验证 Broker 是否回了 PINGRESP。TCP 静默断开时 ESP8266 还能回 `SEND OK`（数据进了 ESP8266 的发送缓冲），但实际没发出去，APP 无从得知。
+
+* **解决**：新增 PING 状态变量 + 超时检查：
+  ```c
+  static uint8_t  ping_pending = 0;      /* 1=已发 PINGREQ 未收 PINGRESP */
+  static uint32_t ping_send_tick = 0;     /* PINGREQ 发送时间戳 */
+
+  /* 发送前先检查上次是否超时 */
+  if (ping_pending && (now - ping_send_tick) >= 15000) {
+      RECONNECT;                          /* 15 秒未收 PINGRESP = 链路死 */
+  }
+  /* 发送成功后置位 */
+  ping_pending = 1;
+  ping_send_tick = now;
+
+  /* 收到 PINGRESP (0xD0) 时清位 */
+  if (pkt_type == 0xD0) {
+      ping_pending = 0;
+  }
+  ```
+  RECONNECT 时也要清 `ping_pending`，避免重连后误判超时。
+
+* **教训**：心跳机制必须是"发 + 收"双向验证，只发不收等于没心跳。TCP 静默断开是 IoT 长连接的最高频故障，NAT 超时、Broker 重启、网络抖动都会触发，必须靠应用层心跳超时检测兜底。
+
+***
+
+## 坑6：SUBACK 不解析，订阅失败无感知（中）
+
+* **现象**：SUBSCRIBE 报文发出后，原代码 `Skip non-PUBLISH packet (type=0x90)` 直接丢弃 SUBACK，订阅是否成功无从得知。若主题名错误或权限不足导致订阅失败，APP 永远收不到下行命令，但看起来一切正常。
+
+* **解决**：新增 SUBACK 解析分支：
+  ```c
+  } else if (pkt_type == 0x90) {
+      /* SUBACK: 0x90 + len(3) + 报文ID(2) + 返回码(1) */
+      if (mqtt_len >= 5) {
+          uint8_t return_code = mqtt_data[4];
+          if (return_code == 0x80) {
+              /* 订阅失败，触发重连 */
+              RECONNECT;
+          } else {
+              /* 订阅成功，QoS granted = return_code */
+          }
+      }
+  }
+  ```
+  校验报文 ID（SUBSCRIBE 用 0x00 0x01，SUBACK 应回相同 ID），返回码 0x80 表示失败。
+
+* **教训**：MQTT 的每个控制报文都有对应的 ACK（CONNECT/CONNACK、SUBSCRIBE/SUBACK、PINGREQ/PINGRESP），只发不解析 ACK 等于裸奔。即使当前不严格处理，至少要解析返回码识别失败，避免静默故障。
+
+***
+
+## 坑7：MQTT_CONNECT 超时分支无日志，看似卡死实则在重试（低）
+
+* **现象**：CONNACK 超时但 `retry_cnt < 3` 时，原代码什么都不做直接 break，下轮循环重新发 CONNECT。过程无任何日志，看起来像状态机卡死。
+
+* **根因**：状态机逻辑本身正确（break 后下轮重新进状态会重发 CONNECT），但缺少日志让人误判。
+
+* **解决**：加一行重试日志：
+  ```c
+  } else {
+      uart_printf_mutex("[MQTT] CONNACK timeout, will retry (%d/3)\r\n", retry_cnt);
+  }
+  ```
+
+* **教训**：状态机的"留在本状态重试"路径必须有日志，否则调试时无法区分"卡死"和"重试中"。状态机调试三要素：进入日志、离开日志、重试日志。
+
+***
+
+## 成果
+
+* **7 个稳定性 bug 全部修复**：覆盖 AT 指令结果检查、二进制流误判、缓冲区容量、PINGRESP 心跳验证、SUBACK 解析、重试日志 6 个类别的 MQTT 通信稳定性问题。
+
+* **修改文件清单（共 2 个）**：
+  ```
+  app/Src/app_esp8266.c   ← 全部 7 个坑（SendMqttPacket + 掉线检测过滤 + line扩容 + mqtt_accum扩容 + PINGRESP检查 + SUBACK解析 + 重试日志）
+  app/Src/usart.c         ← 坑3（ESP8266_GetLine 截断修复，超长不丢数据）
+  ```
+
+* **编译 0 Error 0 Warning**：app 工程干净通过。硬件实测三种重连场景全部验证：
+  * **断网不断电**：收到 CLOSED → RECONNECT → backoff 退避 → 路由器通电后自动恢复，约 30 秒。
+  * **ESP8266 RST**：boot logo 二进制流被文本过滤挡掉，不误报 Link abnormal；真正的 `ready` URC 触发重连，约 10 秒恢复。
+  * **正常心跳**：30 秒发 PINGREQ → 收到 PINGRESP OK，无误重连，长时间稳定运行。
+
+* **MQTT 通信闭环**：D20 实现了 MQTT 基本收发，当前修改把"能收发但偶发异常"升级为"收发可验证、异常可识别、链路可自愈"。7 个修复思路（AT 指令完整检查、文本格式过滤、缓冲容量对齐、心跳双向验证、ACK 解析、状态机日志）是 MQTT 客户端稳定性的通用范式，可直接迁移到其他 IoT 项目。
+
+
+

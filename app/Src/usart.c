@@ -38,17 +38,29 @@ static uint8_t  esp_rx_last_byte;              /* ISR 每次只接收 1 字节�
 uint16_t ESP8266_GetLine(char *line, uint16_t max_len)
 {
     uint16_t len;
+    uint16_t remain;
     taskENTER_CRITICAL();                              /* 关中断，防止 ISR 竞态 */
     {
         if (esp_rx_wr_idx == 0) {                      /* 空，什么都没收到 */
             taskEXIT_CRITICAL();
             return 0;
         }
-        if (esp_rx_wr_idx >= max_len) esp_rx_wr_idx = max_len - 1;  /* 超长时截断 */
-        memcpy(line, esp_rx_buf, esp_rx_wr_idx);
-        line[esp_rx_wr_idx] = '\0';
-        len = esp_rx_wr_idx;
-        esp_rx_wr_idx = 0;                             /* 清空缓冲区，准备下一行 */
+        if (esp_rx_wr_idx < max_len) {
+            /* 数据量小于 line 容量，全部拷贝，清空缓冲区 */
+            memcpy(line, esp_rx_buf, esp_rx_wr_idx);
+            line[esp_rx_wr_idx] = '\0';
+            len = esp_rx_wr_idx;
+            esp_rx_wr_idx = 0;
+        } else {
+            /* P2 修复：数据量超过 line 容量，只取 max_len-1 字节
+             * 剩余数据 memmove 前移保留，下次调用继续取，不丢数据 */
+            memcpy(line, esp_rx_buf, max_len - 1);
+            line[max_len - 1] = '\0';
+            len = max_len - 1;
+            remain = esp_rx_wr_idx - (max_len - 1);
+            memmove(esp_rx_buf, esp_rx_buf + (max_len - 1), remain);
+            esp_rx_wr_idx = remain;
+        }
     }
     taskEXIT_CRITICAL();                               /* 开中断 */
     return len;

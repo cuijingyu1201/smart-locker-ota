@@ -12,7 +12,6 @@
 *.bin
 *.elf
 *.lnp
-*.sct
 *.ini
 *.dbgconf
 *.bak
