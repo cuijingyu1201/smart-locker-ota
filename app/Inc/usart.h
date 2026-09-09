@@ -47,6 +47,7 @@ void MX_USART2_UART_Init(void);
 uint16_t ESP8266_GetLine(char *line, uint16_t max_len);
 void     ESP8266_ClearRxBuf(void);
 void     ESP8266_StartReceiveIT(void);
+int      ESP8266_PeekMatch(const char *pattern, uint32_t timeout_ms);  /* 只匹配不取走 */
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

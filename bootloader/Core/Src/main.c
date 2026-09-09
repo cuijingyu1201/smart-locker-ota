@@ -117,40 +117,47 @@ int main(void)
 
     if (load_ok == 0 && g_param_buf.ota_request_magic == MAGIC_OTA_REQUEST)
     {
-     
-        printf("\r\n[BOOT] =================================================\r\n");
-        printf("[BOOT] OTA_REQUEST FLAG (magic=0x%08X) detected!\r\n",
-               g_param_buf.ota_request_magic);
-        printf("[BOOT]   Expected new FW: size=%u bytes, CRC=0x%08X\r\n",
-               g_param_buf.ota_new_fw_size, g_param_buf.ota_new_fw_crc32);
-        printf("[BOOT]   Target version: %u.%u.%u.%u\r\n",
-               g_param_buf.ota_new_fw_ver_major,
-               g_param_buf.ota_new_fw_ver_minor,
-               g_param_buf.ota_new_fw_ver_patch,
-               g_param_buf.ota_new_fw_build_num);
-        printf("[BOOT] =================================================\r\n");
-
-        FlashParam_ClearOtaRequest();
-        printf("[BOOT] OTA_request flag pre-cleared (safe for fail-retries)\r\n");
-
-        printf("[BOOT] Enter WiFi-OTA pull (D12).\r\n");
-        printf("[BOOT] To force Serial IAP rescue: KEY0 + Reset\r\n");
-        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
-
-        if (WiFi_IAP_Init() == 0) {
-            int rc = WiFi_IAP_Process(g_param_buf.ota_new_fw_crc32,
-                                      g_param_buf.ota_new_fw_size,
-                                      g_param_buf.ota_new_fw_ver_major,
-                                      g_param_buf.ota_new_fw_ver_minor,
-                                      g_param_buf.ota_new_fw_ver_patch,
-                                      g_param_buf.ota_new_fw_build_num);
-            if (rc != 0) {
-                printf("[BOOT] WiFi_IAP_Process FAIL (rc=%d)\r\n", rc);
-            }
-        } else {
-            printf("[BOOT] WiFi_IAP_Init FAIL\r\n");
+        /*  Bootloader 侧柜门校验（双重校验第二道） */
+        if (g_param_buf.door_state != 0U) {
+            printf("[BOOT] OTA REJECTED: door not closed (door_state=%u), abort OTA\r\n",
+                   g_param_buf.door_state);
+            FlashParam_ClearOtaRequest();   /* 清掉请求，防止反复进 OTA 分支 */
         }
+        else
+        {
+            printf("\r\n[BOOT] =================================================\r\n");
+            printf("[BOOT] OTA_REQUEST FLAG (magic=0x%08X) detected!\r\n",
+                   g_param_buf.ota_request_magic);
+            printf("[BOOT]   Expected new FW: size=%u bytes, CRC=0x%08X\r\n",
+                   g_param_buf.ota_new_fw_size, g_param_buf.ota_new_fw_crc32);
+            printf("[BOOT]   Target version: %u.%u.%u.%u\r\n",
+                   g_param_buf.ota_new_fw_ver_major,
+                   g_param_buf.ota_new_fw_ver_minor,
+                   g_param_buf.ota_new_fw_ver_patch,
+                   g_param_buf.ota_new_fw_build_num);
+            printf("[BOOT] =================================================\r\n");
 
+            FlashParam_ClearOtaRequest();
+            printf("[BOOT] OTA_request flag pre-cleared (safe for fail-retries)\r\n");
+
+            printf("[BOOT] Enter WiFi-OTA pull (D12).\r\n");
+            printf("[BOOT] To force Serial IAP rescue: KEY0 + Reset\r\n");
+            HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
+
+            if (WiFi_IAP_Init() == 0) {
+                int rc = WiFi_IAP_Process(g_param_buf.ota_new_fw_crc32,
+                                          g_param_buf.ota_new_fw_size,
+                                          g_param_buf.ota_new_fw_ver_major,
+                                          g_param_buf.ota_new_fw_ver_minor,
+                                          g_param_buf.ota_new_fw_ver_patch,
+                                          g_param_buf.ota_new_fw_build_num);
+                if (rc != 0) {
+                    printf("[BOOT] WiFi_IAP_Process FAIL (rc=%d)\r\n", rc);
+                }
+            } else {
+                printf("[BOOT] WiFi_IAP_Init FAIL\r\n");
+            }
+        }   /* end of else (door_state == 0) */
     }
 
     else if (FLASH_ReadWord(OTA_FLAG_ADDR) == MAGIC_OLD_OTA_FLAG) {

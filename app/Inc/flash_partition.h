@@ -1,4 +1,4 @@
-﻿#ifndef __FLASH_PARTITION_H
+#ifndef __FLASH_PARTITION_H
 #define __FLASH_PARTITION_H
 
 #include "main.h"   // HAL 里已经有了 uint32_t/uint16_t 这些类型
@@ -80,8 +80,15 @@ typedef struct __attribute__((packed, aligned(4))) {
     uint16_t ota_new_fw_ver_minor; /* 0x6A: OTA 目标次版本 */
     uint16_t ota_new_fw_ver_patch; /* 0x6C: OTA 目标补丁版本 */
     uint16_t ota_new_fw_build_num; /* 0x6E: OTA 目标构建号 */
-    uint8_t  reserved[0xF80];     /* 0x70~0xFEF: 预留，填充到 4080 字节 */
-
+		
+		/* ---------- D6: 1柜运行状态持久化 ---------- */
+    uint8_t  door_state;          /* 0x70: 柜门状态 0=CLOSED 1=OPEN 2=FAULT */
+    uint8_t  rsvd_door[3];        /* 0x71~0x73: 4字节对齐填充 */
+    uint32_t last_open_ts;        /* 0x74: 上次开柜时间戳（秒，uptime） */
+    char     current_code[8];     /* 0x78: 当前取件码 "123456\0" + 1B预留 */
+    uint32_t erase_cnt;           /* 0x80: Flash擦写计数，满1000次告警 */
+    uint8_t  reserved[0xF6C];     /* 0x84~0xFEF: 预留，填充到 4080 字节 */
+		
     /* ---------- Tail：最后 16 字节冗余校验 ---------- */
     uint32_t tail_marker;         /* 0xFF0: 0xDEADBEEF，用来快速判断参数区有没有写满 */
     uint32_t tail_crc32;          /* 0xFF4: 整包二次 CRC（可选，头部一次尾部一次） */

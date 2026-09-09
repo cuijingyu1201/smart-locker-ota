@@ -25,6 +25,12 @@ DebugConfig/
 ReleaseConfig/
 *.user
 
+# scatter 文件：忽略 development_history 里的编译产物 .sct，
+# 但允许主工程 app/bootloader 的 .sct 被跟踪（用否定规则）
+*.sct
+!app/MDK-ARM/**/*.sct
+!bootloader/MDK-ARM/**/*.sct
+
 # CubeMX 临时文件
 *.ioc.bak
 

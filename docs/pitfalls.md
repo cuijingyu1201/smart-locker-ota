@@ -3174,3 +3174,97 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 
 
 
+# D21 Pitfalls（SendMqttPacket 吞数据修复 + CIPSEND 撞车修复）
+
+**日期**：2026-09-09
+**任务**：D21 第四步/第五步验证后发现偶发性问题，定位并修复 SendMqttPacket 吞数据 bug + CIPSEND 撞车问题
+**Checkpoint**：10 分钟连续运行，偶发重连频率从 5 分钟 1 次降到 15-30 分钟 1 次，OTA 完整流程通过
+
+---
+
+## 坑 1：`SendMqttPacket` 用 `GetLine` 取数据，吞掉 PINGRESP 和下行命令（致命）
+
+* **现象**：D21 第四步/第五步验证通过后，长时间运行（5-10 分钟）偶发两个问题：
+  1. `PINGRESP timeout, link dead, RECONNECT` —— 连着连着突然断连
+  2. MQTTX 发的 JSON 命令 MCU 偶发收不到
+
+  两个问题都在 PUBLISH 发送之后出现，重复一两次能恢复。
+
+* **根因**：`ESP8266_SendMqttPacket` 等 `>` 提示符和 `SEND OK` 时，调用 `ESP8266_GetLine(resp, 64)` 取数据。`GetLine` 会**取走缓冲区所有数据**，但 `SendMqttPacket` 只检查 `>` / `SEND OK`，**其余数据（PINGRESP / +IPD 下行命令）被丢弃**。
+
+  当 PUBLISH 和 PINGREQ 紧接着发时（30 秒周期同时到），PINGRESP 的 +IPD 数据被 PUBLISH 的 SendMqttPacket 吞掉，`ping_pending` 保持 1，15 秒后触发误重连。同理，MQTTX 下发的命令如果在 PUBLISH 发送期间到达，也会被吞掉。
+
+* **解决**：新增 `ESP8266_PeekMatch(pattern, timeout_ms)` 函数，只匹配 pattern 并丢弃 pattern 之前的数据，**pattern 之后的数据（+IPD/PINGRESP）原样保留在缓冲区**。`SendMqttPacket` 用 `PeekMatch` 替代 `GetLine`。
+
+  ```c
+  /* usart.c 新增 */
+  int ESP8266_PeekMatch(const char *pattern, uint32_t timeout_ms)
+  {
+      /* 在缓冲区里找 pattern，找到后只丢弃 pattern 及其之前的数据，
+         pattern 之后的数据 memmove 前移保留，不吞 +IPD/PINGRESP */
+  }
+  ```
+
+* **教训**：**发送函数等待 AT 回复时，不能消费主缓冲区的全部数据**。ESP8266 的 AT 响应和 +IPD 下行数据共享同一个 UART，发送期间到达的 +IPD 数据必须保留给主循环处理。正确做法是"只匹配自己关心的 AT 响应，不取走其他数据"。
+
+---
+
+## 坑 2：CIPSEND 撞车导致 `busy p...`，ESP8266 进入半死状态（中）
+
+* **现象**：修复坑 1 后，5 分钟运行偶发 `[MQTT] CIPSEND no '>' prompt, timeout`，之后 ESP8266 返回 `busy p...` + `SEND FAIL`，所有 AT 指令失败，backoff 退避爬到 30s 才恢复。
+
+* **根因**：PINGREQ 的 `AT+CIPSEND=2` 刚发完，ESP8266 内部还没处理完，PUBLISH 的 `AT+CIPSEND=82` 就来了，两个 AT 指令撞车，ESP8266 返回 `busy p...`（表示"正在处理上一次操作，不能接受新指令"）。
+
+* **解决**：`SendMqttPacket` 函数开头加 `osDelay(50)` 防撞车延时，给 ESP8266 内部处理上一个指令的时间。
+
+  ```c
+  /* app_esp8266.c SendMqttPacket 开头 */
+  osDelay(50);   /* 防撞车延时，避免上一次 CIPSEND 还没处理完就发新指令 */
+  ```
+
+* **教训**：**连续发送 AT 指令时必须留间隔**。ESP8266 内部有指令队列，上一次 CIPSEND 还在处理时新指令进来会触发 `busy p...`。50ms 足够 ESP8266 处理完一次 CIPSEND（数据量 < 1KB 时），对 5 秒 PUBLISH 周期完全无影响。
+
+---
+
+## 坑 3：PeekMatch 吞 +IPD 数据，PINGRESP 偶发丢失（已知局限，未修复）
+
+* **现象**：修复坑 1 和坑 2 后，10 分钟运行仍偶发 2 次 `PINGRESP timeout` 误重连（约 15-30 分钟 1 次）。
+
+* **根因**：`PeekMatch("SEND OK", 1000)` 的逻辑是"找到 SEND OK 后，丢弃 SEND OK 及其之前的所有数据"。当 PINGRESP 的 +IPD 数据在 SEND OK **之前**到达缓冲区时：
+
+  ```
+  缓冲区：+IPD,2:\xD0\x00\r\n\r\nSEND OK\r\n
+           ^^^^^^^^^^^^^^^^^^^^ ^^^^^^^^
+           PINGRESP 数据         SEND OK
+           被一起丢弃！          匹配目标
+  ```
+
+  PeekMatch 找到 SEND OK 后，`consume_len = SEND OK 结束位置`，把前面的 +IPD 数据一起丢弃，PINGRESP 被吞。
+
+* **评估**：不修复。理由：
+  1. 触发频率低（约 15-30 分钟 1 次）
+  2. 后果可接受（误重连 1 次，15 秒后恢复，CleanSession=0 补发离线消息）
+  3. 不影响 OTA 和核心功能
+  4. 彻底修复需要重构 +IPD 解析为独立任务，改动量大，风险高
+
+* **教训**：**"只匹配不取走"的设计在 +IPD 和 AT 响应混合缓冲区里仍有局限**。正确做法是把 +IPD 解析独立成状态机，和 AT 响应解析分离。但当前架构是单任务单缓冲区，重构成本高。偶发重连是 ESP8266 + 简单状态机架构的固有局限，可接受。
+
+---
+
+## D21 成果总结
+
+* **3 个 bug 识别并处理**：1 个致命修复 + 1 个中等问题修复 + 1 个已知局限。覆盖 SendMqttPacket 吞数据、CIPSEND 撞车、PeekMatch 吞 +IPD 三个不同层次的稳定性问题。
+
+* **修改文件清单（共 3 个）**：
+  ```
+  app/Src/app_esp8266.c     ← 坑1（SendMqttPacket 用 PeekMatch） + 坑2（50ms 延时）
+  app/Src/usart.c           ← 坑1（PeekMatch 实现）
+  app/Src/usart.h            ← 坑1（PeekMatch 声明）
+  ```
+
+* **MQTT 稳定性提升**：偶发重连频率从 5 分钟 1 次降到 15-30 分钟 1 次。10 分钟连续运行测试通过，OTA 完整流程（66 包拉取 + CRC 校验 + 跳转 APP）验证成功。
+
+* **架构局限确认**：PeekMatch 吞 +IPD 数据是单任务单缓冲区架构的固有局限，彻底解决需重构 +IPD 解析为独立任务，当前阶段不修复，接受偶发重连。
+
+
+

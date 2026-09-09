@@ -61,6 +61,10 @@ int FlashParam_InitOnBoot(void)
         g_param_buf_internal.last_ota_result = 0U;
         memcpy(g_param_buf_internal.device_id, "dev001", 6U);
         memcpy(g_param_buf_internal.mqtt_topic_prefix, "iot/dev001", 10U);
+			  g_param_buf_internal.door_state = 0U;                          /* 默认门关 */
+        g_param_buf_internal.last_open_ts = 0U;                        /* 无开柜记录 */
+        memcpy(g_param_buf_internal.current_code, "123456", 6U);      /* 默认取件码 */
+        g_param_buf_internal.erase_cnt = 0U;                           /* 擦写计数清零 */
     } else {
         uart_printf_mutex("[PARAM] Loaded: fw=%u.%u.%u build%u, boots=%lu, prev_ota=%lu\r\n",
                           g_param_buf_internal.fw_ver_major,
@@ -262,5 +266,73 @@ void FlashParam_Print(const flash_param_t *p)
     uart_printf_mutex("  last_ota_result = %lu\r\n", p->last_ota_result);
     uart_printf_mutex("  device_id       = %.16s\r\n", p->device_id);
     uart_printf_mutex("  mqtt_prefix     = %.32s\r\n", p->mqtt_topic_prefix);
+		uart_printf_mutex("  door_state      = %u\r\n", p->door_state);
+    uart_printf_mutex("  last_open_ts    = %lu s\r\n", (unsigned long)p->last_open_ts);
+    uart_printf_mutex("  current_code    = %.6s\r\n", p->current_code);
+    uart_printf_mutex("  erase_cnt       = %lu\r\n", (unsigned long)p->erase_cnt);
     uart_printf_mutex("=========================================\r\n\r\n");
 }
+
+/* ================================================================
+ *   柜态持久化 API 实现
+ *   注意：每个函数都会整页擦+写 Flash，不能在循环里高频调用
+ * ================================================================ */
+int FlashParam_SetDoorState(uint8_t state)
+{
+    /* 1. 读参数区到 RAM，如果无效先填默认值 */
+    if (FlashParam_Load(&g_param_buf_internal) != 0) {
+        memset(&g_param_buf_internal, 0xFF, sizeof(g_param_buf_internal));
+        g_param_buf_internal.boot_count = 0U;
+        g_param_buf_internal.fw_ver_major = FW_VER_MAJOR;
+        g_param_buf_internal.fw_ver_minor = FW_VER_MINOR;
+        g_param_buf_internal.fw_ver_patch = FW_VER_PATCH;
+        g_param_buf_internal.fw_build_num = FW_BUILD_NUM;
+    }
+    /* 2. 改字段 */
+    g_param_buf_internal.door_state = state;
+    g_param_buf_internal.erase_cnt += 1U;
+    /* 3. 写回 Flash（内部擦+写） */
+    int ret = FlashParam_Save(&g_param_buf_internal);
+    /* 4. 擦写计数告警检查 */
+    if (g_param_buf_internal.erase_cnt >= 1000U) {
+        uart_printf_mutex("[PARAM] WARN erase_cnt=%lu >= 1000, flash life warning\r\n",
+                         (unsigned long)g_param_buf_internal.erase_cnt);
+    }
+    return ret;
+}
+
+uint8_t FlashParam_GetDoorState(void)
+{
+    if (FlashParam_Load(&g_param_buf_internal) != 0) {
+        return 0U;   /* 参数区无效，默认 CLOSED */
+    }
+    return g_param_buf_internal.door_state;
+}
+
+int FlashParam_RecordOpen(void)
+{
+    if (FlashParam_Load(&g_param_buf_internal) != 0) {
+        memset(&g_param_buf_internal, 0xFF, sizeof(g_param_buf_internal));
+        g_param_buf_internal.boot_count = 0U;
+        g_param_buf_internal.fw_ver_major = FW_VER_MAJOR;
+        g_param_buf_internal.fw_ver_minor = FW_VER_MINOR;
+        g_param_buf_internal.fw_ver_patch = FW_VER_PATCH;
+        g_param_buf_internal.fw_build_num = FW_BUILD_NUM;
+    }
+    g_param_buf_internal.door_state = 1U;   /* OPEN */
+    g_param_buf_internal.last_open_ts = osKernelGetTickCount() / 1000U;
+    g_param_buf_internal.erase_cnt += 1U;
+    return FlashParam_Save(&g_param_buf_internal);
+}
+
+uint32_t FlashParam_IncEraseCnt(void)
+{
+    if (FlashParam_Load(&g_param_buf_internal) != 0) {
+        memset(&g_param_buf_internal, 0xFF, sizeof(g_param_buf_internal));
+        g_param_buf_internal.boot_count = 0U;
+    }
+    g_param_buf_internal.erase_cnt += 1U;
+    FlashParam_Save(&g_param_buf_internal);
+    return g_param_buf_internal.erase_cnt;
+}
+

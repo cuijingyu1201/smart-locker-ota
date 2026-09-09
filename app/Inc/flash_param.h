@@ -1,4 +1,4 @@
-﻿#ifndef __FLASH_PARAM_H
+#ifndef __FLASH_PARAM_H
 #define __FLASH_PARAM_H
 
 #include "flash_partition.h"
@@ -39,6 +39,29 @@ int FlashParam_ClearOtaRequest(void);
 
 /* 调试用：用 printf 把参数区所有字段打印出来 */
 void FlashParam_Print(const flash_param_t *p);
+
+/* ================================================================
+ *   柜态持久化 API（状态机进稳态时调用）
+ *   注意：每次写都会整页擦+写，不能在循环里高频调用
+ * ================================================================ */
+
+/* 写柜门状态（状态机进 CLOSED/FAULT 时调）
+ *   state: 0=CLOSED 1=OPEN 2=FAULT
+ *   返回 0=成功 -1=失败 */
+int FlashParam_SetDoorState(uint8_t state);
+
+/* 读柜门状态，返回 0=CLOSED 1=OPEN 2=FAULT（参数区无效时返回 0） */
+uint8_t FlashParam_GetDoorState(void);
+
+/* 记录一次开柜：写 door_state=1 + last_open_ts=当前秒数
+ *   在 Cabinet_FSM_OpenRequest 被接受时调用
+ *   返回 0=成功 -1=失败 */
+int FlashParam_RecordOpen(void);
+
+/* Flash 擦写计数 +1，返回当前计数值
+ *   每次 SetDoorState/RecordOpen 内部会自动 +1
+ *   满第一千次时调用方应上报告警 */
+uint32_t FlashParam_IncEraseCnt(void);
 
 #endif /* __FLASH_PARAM_H */
 

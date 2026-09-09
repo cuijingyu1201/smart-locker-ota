@@ -134,6 +134,12 @@ void OTA_TriggerUpgrade(uint16_t ver_major, uint16_t ver_minor,
                         uint32_t new_fw_crc, uint32_t new_fw_size,
                         uint8_t force)
 {
+	  /* OTA 前置检查 —— 柜门必须关着才能升级 */
+    uint8_t door = FlashParam_GetDoorState();
+    if (door != 0U) {
+        uart_printf_mutex("[OTA] REJECT: door not closed (door_state=%u), close door first\r\n", door);
+        return;   /* 不写参数区，不复位，等用户关门后重发 */
+    }
     int ret;
     uint16_t cur_major, cur_minor, cur_patch, cur_build;
 

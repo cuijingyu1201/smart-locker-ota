@@ -78,6 +78,59 @@ void ESP8266_ClearRxBuf(void)
 }
 
 /*
+ * ESP8266_PeekMatch：在接收缓冲区里找 pattern 子串，只看不取走
+ *   匹配成功：返回 1，并把匹配位置之前的数据丢弃（含 pattern 本身）
+ *   超时未匹配：返回 0，缓冲区数据保持不变（让主循环 GetLine 正常消费）
+ *   参数 pattern：要匹配的字符串（如 ">" 或 "SEND OK"）
+ *   参数 timeout_ms：超时时间（毫秒）
+ *
+ *   设计目的：SendMqttPacket 等发送函数等待 AT 回复时，
+ *   只消费自己关心的 AT 响应，不吞掉 +IPD/PINGRESP 等下行数据
+ */
+int ESP8266_PeekMatch(const char *pattern, uint32_t timeout_ms)
+{
+    uint32_t wait_start = osKernelGetTickCount();
+    int pat_len = (int)strlen(pattern);
+
+    while ((osKernelGetTickCount() - wait_start) < timeout_ms) {
+        uint16_t wr_idx;
+        int found = 0;
+        uint16_t consume_len = 0;
+
+        taskENTER_CRITICAL();
+        {
+            wr_idx = esp_rx_wr_idx;
+            if (wr_idx >= (uint16_t)pat_len) {
+                /* 在缓冲区里搜索 pattern */
+                for (uint16_t i = 0; i + pat_len <= wr_idx; i++) {
+                    if (memcmp(&esp_rx_buf[i], pattern, (size_t)pat_len) == 0) {
+                        found = 1;
+                        /* 丢弃 pattern 结束位置之前的所有数据（含 pattern）*/
+                        consume_len = (uint16_t)(i + pat_len);
+                        if (consume_len < wr_idx) {
+                            /* pattern 后还有数据，前移保留 */
+                            memmove(esp_rx_buf, esp_rx_buf + consume_len, wr_idx - consume_len);
+                            esp_rx_wr_idx = wr_idx - consume_len;
+                        } else {
+                            /* pattern 后没有数据，清空 */
+                            esp_rx_wr_idx = 0;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        taskEXIT_CRITICAL();
+
+        if (found) {
+            return 1;
+        }
+        osDelay(10);
+    }
+    return 0;   /* 超时未匹配 */
+}
+
+/*
  * ESP8266_StartReceiveIT：启动 USART2 逐字节中断接收
  * 要求 FreeRTOS IPC 初始化完成后调用，否则信号量句柄可能为 NULL
  */

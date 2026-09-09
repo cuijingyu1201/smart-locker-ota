@@ -722,37 +722,29 @@ static int ESP8266_SendRaw(const char *data, uint16_t len)
 /* ================================================================
  * ESP8266_SendMqttPacket：带结果检查的 MQTT 报文发送
  *   完整四步：AT+CIPSEND → 等 ">" → 发数据 → 等 "SEND OK"
+ *   修复：用 PeekMatch 只消费 AT 回复，不吞 +IPD/PINGRESP 等下行数据
  *   返回：0=成功，-1=失败（调用者应触发重连）
  * ================================================================ */
 static int ESP8266_SendMqttPacket(const uint8_t *data, uint16_t len)
 {
     char at_cmd[32];
-    char resp[64];
-    int got_prompt = 0;
-    int got_send_ok = 0;
-    uint32_t wait_start;
+
+    /* 第 0 步：防撞车延时 50ms
+     * 避免上一次 CIPSEND/AT 指令还没处理完就发新指令导致 busy p... */
+    osDelay(50);
 
     /* 第 1 步：发 AT+CIPSEND=len */
     snprintf(at_cmd, sizeof(at_cmd), "AT+CIPSEND=%d\r\n", len);
     ESP8266_SendRaw(at_cmd, strlen(at_cmd));
 
-    /* 第 2 步：等 ">" 提示符（最长 1 秒） */
-    wait_start = osKernelGetTickCount();
-    while ((osKernelGetTickCount() - wait_start) < 1000) {
-        if (ESP8266_GetLine(resp, sizeof(resp)) > 0) {
-            if (strchr(resp, '>') != NULL) {
-                got_prompt = 1;
-                break;
-            }
-            /* 如果回复 ERROR，说明连接已断 */
-            if (strstr(resp, "ERROR") != NULL) {
-                uart_printf_mutex("[MQTT] CIPSEND ERROR (link down?)\r\n");
-                return -1;
-            }
+    /* 第 2 步：等 ">" 提示符（最长 1 秒）
+     * PeekMatch 只匹配并丢弃 ">" 之前的 AT 回显，不吞后面的 +IPD 数据 */
+    if (!ESP8266_PeekMatch(">", 1000)) {
+        /* 检查是否 ERROR（link down）*/
+        char tmp[64];
+        if (ESP8266_GetLine(tmp, sizeof(tmp)) > 0 && strstr(tmp, "ERROR") != NULL) {
+            uart_printf_mutex("[MQTT] CIPSEND ERROR (link down?)\r\n");
         }
-        osDelay(20);
-    }
-    if (!got_prompt) {
         uart_printf_mutex("[MQTT] CIPSEND no '>' prompt, timeout\r\n");
         return -1;
     }
@@ -760,22 +752,16 @@ static int ESP8266_SendMqttPacket(const uint8_t *data, uint16_t len)
     /* 第 3 步：发 MQTT 数据 */
     ESP8266_SendRaw((const char *)data, len);
 
-    /* 第 4 步：等 "SEND OK"（最长 1 秒） */
-    wait_start = osKernelGetTickCount();
-    while ((osKernelGetTickCount() - wait_start) < 1000) {
-        if (ESP8266_GetLine(resp, sizeof(resp)) > 0) {
-            if (strstr(resp, "SEND OK") != NULL) {
-                got_send_ok = 1;
-                break;
-            }
-            if (strstr(resp, "ERROR") != NULL || strstr(resp, "FAIL") != NULL) {
-                uart_printf_mutex("[MQTT] SEND FAIL/ERROR\r\n");
-                return -1;
-            }
+    /* 第 4 步：等 "SEND OK"（最长 1 秒）
+     * PeekMatch 只消费 SEND OK，不吞后续的 +IPD/PINGRESP */
+    if (!ESP8266_PeekMatch("SEND OK", 1000)) {
+        /* 超时后检查缓冲区有没有 ERROR/FAIL */
+        char tmp[64];
+        if (ESP8266_GetLine(tmp, sizeof(tmp)) > 0 &&
+            (strstr(tmp, "ERROR") != NULL || strstr(tmp, "FAIL") != NULL)) {
+            uart_printf_mutex("[MQTT] SEND FAIL/ERROR\r\n");
+            return -1;
         }
-        osDelay(20);
-    }
-    if (!got_send_ok) {
         uart_printf_mutex("[MQTT] no SEND OK, timeout\r\n");
         return -1;
     }

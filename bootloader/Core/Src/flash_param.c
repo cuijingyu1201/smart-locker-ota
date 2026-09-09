@@ -193,6 +193,8 @@ void FlashParam_Print(const flash_param_t *p)
     printf("  last_ota_result = %u\r\n", p->last_ota_result);
     printf("  device_id       = %.16s\r\n", p->device_id);
     printf("  mqtt_prefix     = %.32s\r\n", p->mqtt_topic_prefix);
+		printf("  door_state      = %u\r\n", p->door_state);
+    printf("  erase_cnt       = %u\r\n", p->erase_cnt);
     printf("=========================================\r\n\r\n");
 }
 

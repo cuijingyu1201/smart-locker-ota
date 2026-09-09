@@ -4,6 +4,7 @@
 #include "app_uart.h"
 #include "cmsis_os2.h"
 #include "app_ipc.h"
+#include "flash_param.h" 
 
 /* ============================================================
  *  D4 配置：是否启用红外取件检测
@@ -77,6 +78,13 @@ static void fsm_transition(cabinet_state_e new_state)
                       Cabinet_FSM_StateStr(new_state));
     s_state = new_state;
     s_state_enter_tick = osKernelGetTickCount();
+		/* 稳态持久化 —— 进 CLOSED 或 FAULT 时写 Flash */
+    if (new_state == CAB_STATE_CLOSED) {
+        FlashParam_SetDoorState(0U);   /* CLOSED */
+    } else if (new_state == CAB_STATE_FAULT) {
+        FlashParam_SetDoorState(2U);   /* FAULT */
+    }
+    /* OPENING/WAIT_PICKUP/TIMEOUT_CLOSING 是过渡态，不写 Flash */
 }
 
 /* ============================================================
@@ -143,6 +151,7 @@ void Cabinet_FSM_Task(void *argument)
             if (s_open_request) {
                 s_open_request = 0;
                 App_Servo_Unlock();          /* 舵机开锁 */
+								FlashParam_RecordOpen();     /* 记录开柜（写 door_state=1 + 时间戳） */
                 fsm_transition(CAB_STATE_OPENING);
             }
             break;
