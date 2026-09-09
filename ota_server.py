@@ -39,7 +39,7 @@ def send_json(conn, obj):
     s = json.dumps(obj, separators=(',', ':')) + '\r\n'
     conn.sendall(s.encode('utf-8'))
 
-def handle_device(conn, fw_data, fw_size, fw_crc, packets):
+def handle_device(conn, fw_data, fw_size, fw_crc, packets, corrupt_seq=-1):
     # 1. Wait HELLO
     line = recv_line(conn, 15)
     if line is None:
@@ -93,6 +93,16 @@ def handle_device(conn, fw_data, fw_size, fw_crc, packets):
     for seq in range(packets):
         offset = seq * BLOCK_SIZE
         chunk = fw_data[offset:offset + BLOCK_SIZE]
+        # S8 故障注入：翻转指定包的 chunk[100] 字节，制造"传输损坏"场景
+        # 不污染原 fw_data：经 bytearray 拷贝再转回 bytes；最后一包不足 100B 时取末字节
+        if corrupt_seq >= 0 and seq == corrupt_seq:
+            chunk_ba = bytearray(chunk)
+            corrupt_idx = min(100, len(chunk_ba) - 1)
+            orig_byte = chunk_ba[corrupt_idx]
+            chunk_ba[corrupt_idx] ^= 0xFF
+            chunk = bytes(chunk_ba)
+            print(f"[OTA] !!! INJECT FAULT: corrupted seq={seq} byte[{corrupt_idx}] "
+                  f"(0x{orig_byte:02X} -> 0x{chunk[corrupt_idx]:02X}) for S8 test")
         b64 = base64.b64encode(chunk).decode('ascii')
         frame = {"type": "DATA", "seq": seq, "data": b64}
         ack_ok = False
@@ -134,10 +144,23 @@ def handle_device(conn, fw_data, fw_size, fw_crc, packets):
         pass
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python ota_server.py <firmware.bin>")
+    # 解析可选参数 --corrupt-seq=N：S8 传输损坏测试用，N 为 DATA 包序号（0-based）
+    # 兼容固件路径与 --corrupt-seq 的任意顺序：python ota_server.py app.bin --corrupt-seq=5
+    corrupt_seq = -1
+    fw_path = None
+    for a in sys.argv[1:]:
+        if a.startswith('--corrupt-seq='):
+            try:
+                corrupt_seq = int(a.split('=', 1)[1])
+            except ValueError:
+                print("Invalid --corrupt-seq value, must be integer")
+                sys.exit(1)
+        elif not a.startswith('--') and fw_path is None:
+            fw_path = a
+    if fw_path is None:
+        print("Usage: python ota_server.py <firmware.bin> [--corrupt-seq=N]")
+        print("       N = DATA packet seq (0-based) to corrupt for S8 test; omit for normal OTA")
         sys.exit(1)
-    fw_path = sys.argv[1]
     with open(fw_path, 'rb') as f:
         fw_data = f.read()
     fw_size = len(fw_data)
@@ -146,6 +169,13 @@ def main():
         print(f"Invalid firmware size {fw_size}; expected 1..0x74000 bytes")
         sys.exit(1)
     packets = (fw_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+    # corrupt_seq 越界检查：>= packets 时忽略，防止发 DATA 时访问不到该包
+    if corrupt_seq >= 0:
+        if corrupt_seq >= packets:
+            print(f"[OTA] !!! --corrupt-seq={corrupt_seq} out of range (0..{packets-1}), ignored")
+            corrupt_seq = -1
+        else:
+            print(f"[OTA] !!! FAULT INJECTION ENABLED: seq={corrupt_seq} will be corrupted (S8 test)")
     print(f"[OTA] FW: {fw_path}")
     print(f"[OTA]   size={fw_size} crc=0x{fw_crc:08X} packets={packets} block={BLOCK_SIZE}")
 
@@ -161,7 +191,7 @@ def main():
             conn, addr = srv.accept()
             print(f"\n[OTA] === Device connected from {addr[0]}:{addr[1]} ===")
             try:
-                handle_device(conn, fw_data, fw_size, fw_crc, packets)
+                handle_device(conn, fw_data, fw_size, fw_crc, packets, corrupt_seq)
             except Exception as e:
                 print(f"[OTA] !!! handle error: {e}")
             conn.close()

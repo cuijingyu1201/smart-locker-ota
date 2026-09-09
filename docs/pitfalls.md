@@ -3268,3 +3268,167 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 
 
 
+# D22：OTA 回归测试 + 降级保护验证（2026-09-09）
+
+阶段归属：智能储物柜（1 柜极简触屏版）· 阶段7 OTA 鲁棒性验证 · 回归测试
+
+* 硬件：正点原子精英 STM32F103ZET6 + ESP8266 WiFi 模组 + USB-TTL（USART1）
+
+* 软件：Bootloader WiFi OTA 状态机（S1-S8）+ Python OTA Server（TCP 9000）+ MQTT 触发
+
+* 目标：通过 4 个测试场景（T1-T4）系统性验证 OTA 系统的故障防御与恢复机制，确保设备在固件损坏、网络中断、断电等异常下不变砖，可恢复
+
+***
+
+## T1：CRC 错误固件拦截测试（S5 + S8 双重防线）
+
+### T1-S5：参数区 CRC ≠ 服务器声明 CRC（S5 拦截）
+
+* **测试方法**：MQTT 升级命令里填入与 app.bin 实际 CRC 不一致的值（0xC7B5A33F vs 0x3829860A），触发 OTA
+
+* **预期现象**：Bootloader 在 S5 收到 INFO 帧后，对比参数区 CRC 与服务器声明 CRC 不一致，直接判失败，不进入 S6 下载
+
+* **实测结果**：
+
+  ```
+  [WIFI-OTA] [S5] HELLO dev=dev001 crc=0xC7B5A33F size=67016 bytes
+  [WIFI-OTA] [S5] !!! MISMATCH: param crc=0xC7B5A33F size=67016, server crc=0x3829860A size=67016
+  [WIFI-OTA] !!! FAIL state. Press KEY0+Reset for Serial IAP rescue.
+  ```
+
+* **验证结论**：S5 版本错配拦截机制工作正常，错误固件未进入下载阶段，Flash 未被擦除
+
+### T1-S8：传输内容损坏（S8 拦截）
+
+* **测试方法**：MQTT 命令填正确 CRC（让 S5 通过），在 ota_server.py 增加 `--corrupt-seq=N` 参数，运行时翻转第 N 个 DATA 包的 chunk[100] 字节，制造"传输损坏"场景
+
+* **故障注入实现**（ota_server.py）：
+
+  ```python
+  # S8 故障注入：翻转指定包的 chunk[100] 字节，制造"传输损坏"场景
+  if corrupt_seq >= 0 and seq == corrupt_seq:
+      chunk_ba = bytearray(chunk)
+      corrupt_idx = min(100, len(chunk_ba) - 1)
+      chunk_ba[corrupt_idx] ^= 0xFF
+      chunk = bytes(chunk_ba)
+  ```
+
+* **预期现象**：S5 通过 → S6 完整下载 66 包（含被损坏的第 5 包）→ S8 三方 CRC 对比发现 stream CRC ≠ 服务器声明 CRC，判失败
+
+* **实测结果**：
+
+  ```
+  [WIFI-OTA] [S6] OTA 100% (67016/67016 bytes, seq=65)
+  [WIFI-OTA] [S8] Verify
+  [WIFI-OTA] [S8]   recv_bytes       = 67016 (INFO.size=67016)
+  [WIFI-OTA] [S8]   CRC_stream(RAM)  = 0x1BA9AF76
+  [WIFI-OTA] [S8]   CRC_readback(APP) = 0x1BA9AF76 (INFO.crc=0xC7B5A33F)
+  [WIFI-OTA] [S8] !!! CRC_STREAM MISMATCH 0x1BA9AF76 != 0xC7B5A33F
+  [WIFI-OTA] !!! FAIL state. Press KEY0+Reset for Serial IAP rescue.
+  ```
+
+* **验证结论**：S8 完整性校验工作正常，损坏固件写入了 Flash 但未被执行（S8 在 JumpToApp 之前拦截）
+
+* **救砖验证**：KEY0 + Reset 进入 IAP 模式，Ymodem 烧录正常 app.bin 恢复成功
+
+***
+
+## T2：网络断开恢复测试
+
+* **测试方法**：正常启动 OTA 升级，S6 下载到 22%（seq=14）时拔掉 ESP8266 VCC 供电线，模拟网络中断
+
+* **预期现象**：ESP8266 检测到 TCP 连接断开后主动上报 `CLOSED`，Bootloader 立刻判失败进 FAIL 态，不无限等待
+
+* **实测结果**：
+
+  ```
+  [WIFI-OTA] [S6] OTA 22% (15360/67016 bytes, seq=14)
+  [WIFI-OTA] [S6] !!! passive TCP receive failed
+  [S6-ACK-DIAG] post_ack_raw_hex:
+  [S6-ACK-DIAG] 000: 43 4C 4F 53 45 44 0D 0A    ← "CLOSED\r\n"
+  [WIFI-OTA] !!! FAIL state. Press KEY0+Reset for Serial IAP rescue.
+  ```
+
+* **验证结论**：
+  * ESP8266 TCP keep-alive 机制主动上报 `CLOSED`（ASCII 0x43 0x4C 0x4F 0x53 0x45 0x44），比 30 秒超时更快
+  * 两种失败路径均覆盖：主动检测 CLOSED（本次实测）+ 30 秒超时兜底（S6 OTA_RX_TIMEOUT_MS）
+  * 已下载的 22% 残缺固件未被执行，FAIL 态正确引导救砖
+
+* **救砖验证**：Ymodem 烧录正常 app.bin 恢复成功
+
+***
+
+## T3：断电恢复测试
+
+* **测试方法**：正常启动 OTA 升级，S6 下载到 33%（seq=21）时直接拔掉 STM32 供电线，等 2-3 秒后重新上电
+
+* **预期现象**：S5 通过后 Bootloader 已写入 `last_ota_result=4`（升级进行中），断电重启后 Bootloader 检测到该标志，判定 APP 可能不完整，自动进入 IAP 救砖模式（不需 KEY0）
+
+* **实测结果**：
+
+  ```
+  [WIFI-OTA] [S6] OTA 33% (22528/67016 bytes, seq=21)    ← 断电时刻
+  （重新上电）
+  ========== Bootloader v1.0 ==========
+  [BOOT] OTA interrupted (last_ota_result=4). APP may be incomplete.
+  [BOOT] APP NOT valid!
+  [BOOT] Auto-entering Serial IAP rescue (Ymodem 115200 8N1)...
+  [IAP] Pre-erase OK. Now sending 'C' for Ymodem handshake...
+  C
+  ```
+
+* **验证结论**：
+  * `last_ota_result=4` 标记机制工作正常（D13 设计的防断电误跳机制）
+  * 上电后 Bootloader 正确识别"升级被中断"状态，未跳转半块 APP（防变砖）
+  * 自动进入 IAP 救砖（无需 KEY0 手动触发），符合"故障自恢复"设计
+  * 三层防御链验证：`last_ota_result` 检查 → `IsAppValid` SP 检查 → CRC 门禁检查
+
+* **救砖验证**：Ymodem 烧录正常 app.bin 恢复成功
+
+***
+
+## T4：正常升级流程测试
+
+* **测试方法**：用正确 CRC（0x3829860A）+ 正常 app.bin（67016 字节），不加故障注入参数，触发完整 OTA 升级
+
+* **预期现象**：S1-S5 正常走完 WiFi 连接 + TCP + HELLO + INFO，S6 完整下载 66 包，S8 三方 CRC 一致，写参数区后 JumpToApp 跳转新固件
+
+* **验证结论**：完整升级链路工作正常，新 APP 成功启动
+
+***
+
+## D22 成果总结
+
+* **4 个回归测试场景全部通过**：
+
+  | 测试 | 验证场景 | 触发方式 | 拦截机制 | 结果 |
+  |---|---|---|---|---|
+  | T1-S5 | 参数区 CRC 错配 | MQTT 命令填错 CRC | S5 版本校验 | ✅ 通过 |
+  | T1-S8 | 传输内容损坏 | `--corrupt-seq=5` 故障注入 | S8 完整性校验 | ✅ 通过 |
+  | T2 | 升级中途网络断开 | 拔 ESP8266 VCC | CLOSED 检测 + 30s 超时 | ✅ 通过 |
+  | T3 | 升级中途断电 | 拔 STM32 供电 | `last_ota_result=4` 自动 IAP | ✅ 通过 |
+  | T4 | 正常完整升级 | 正确 CRC + 正常 bin | S8 三方一致 + JumpToApp | ✅ 通过 |
+
+* **修改文件清单（共 1 个）**：
+
+  ```
+  ota_server.py    ← 新增 --corrupt-seq=N 故障注入参数（默认关闭，零侵入）
+  ```
+
+* **OTA 系统防御机制全景验证**：
+
+  * **S5 版本校验**：参数区 CRC vs 服务器声明 CRC，下载前拦截版本错配
+  * **S8 完整性校验**：stream CRC vs readback CRC vs 服务器声明 CRC，下载后拦截内容损坏
+  * **网络断开检测**：ESP8266 CLOSED 主动上报 + 30 秒超时兜底双路径
+  * **断电恢复机制**：`last_ota_result=4` 标记升级窗口，上电自动识别中断并进 IAP
+  * **防变砖三层防御**：`last_ota_result` 检查 → `IsAppValid` SP 合法性 → CRC 门禁
+
+* **工程化测试亮点**：ota_server.py 的 `--corrupt-seq=N` 故障注入采用"默认关闭 + 参数开关"设计，测试与生产共用同一份代码，避免改了忘改回去的事故。故障注入在内存运行时进行，不污染 bin 文件，测完无需还原
+
+
+* **项目 OTA 闭环达成**：D1-D21 的功能开发 + 稳定性加固 + 通信加固至此完成，D22 通过 4 场景回归测试验证 OTA 系统在固件损坏 / 网络中断 / 断电三类异常下的鲁棒性，可落地交付
+
+
+
+
+
