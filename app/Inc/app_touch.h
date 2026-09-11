@@ -12,3 +12,5 @@ void    TaskTouch(void *argument); /* 触摸测试任务 */
 void App_Touch_Calibrate(void);   /* 屏幕2点触摸校准（按住WK_UP上电触发） */
 
 #endif /* APP_TOUCH_H */
+
+

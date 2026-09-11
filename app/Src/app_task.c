@@ -7,6 +7,7 @@
 #include "app_ipc.h"
 #include "app_uart.h"
 #include "cabinet_fsm.h"
+#include "code_check.h"
 
 uint32_t g_irq_cnt = 0;   /* 中断计数，TaskSemHandle 写，TaskPrint 读 */
 
@@ -130,9 +131,9 @@ void TaskKeyPoll(void *argument)
         if (st == GPIO_PIN_SET)
         {
             osEventFlagsSet(g_event_group_handle, BIT_KEY_DOWN);
-            /* D4 临时测试：WK_UP 按下触发开柜（沿触发，只触发一次） */
+            /* D8：WK_UP 按下=确认取件码（沿触发，只触发一次） */
             if (last_st == 0) {
-                Cabinet_FSM_OpenRequest();
+                CodeCheck_OnConfirm();
             }
             last_st = 1;
         }

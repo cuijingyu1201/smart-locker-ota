@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file    app_task.h
  * @brief   D2: FreeRTOS 业务任务定义（LED/Print/IdleHook）
  */
@@ -24,7 +24,7 @@ extern uint32_t g_irq_cnt;
 #define TASK_PRINT_PRIORITY      (osPriorityBelowNormal)
 
 /* ======================== TaskKeyPoll 参数 ======================== */
-#define TASK_KEY_POLL_STACK_SIZE_BYTES   (256U)
+#define TASK_KEY_POLL_STACK_SIZE_BYTES   (1024U)
 #define TASK_KEY_POLL_PRIORITY     (osPriorityAboveNormal)
 
 /* ======================== TaskSemHandle 参数 ======================== */

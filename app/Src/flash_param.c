@@ -2,6 +2,7 @@
 #include "flash_if.h"   /* 复用 flash_if.c 的 FLASH_ErasePage / FLASH_WriteBuf / FLASH_ReadWord */
 #include "app_uart.h"
 #include "ota_manager.h"
+#include "cmsis_os2.h"   /* osKernelGetTickCount 声明 */
 #include <stdio.h>
 #include <string.h>
 
@@ -334,5 +335,27 @@ uint32_t FlashParam_IncEraseCnt(void)
     g_param_buf_internal.erase_cnt += 1U;
     FlashParam_Save(&g_param_buf_internal);
     return g_param_buf_internal.erase_cnt;
+}
+
+
+/* ================================================================
+ *   读当前取件码（D8 取件码校验用）
+ *   参数区无效时返回默认码 "123456"，不返回失败
+ * ================================================================ */
+int FlashParam_GetCurrentCode(char *out, uint8_t len)
+{
+    if (out == NULL || len < 7U) {
+        return -1;
+    }
+    /* 参数区有效：读 Flash 里的 current_code */
+    if (FlashParam_Load(&g_param_buf_internal) == 0) {
+        memcpy(out, g_param_buf_internal.current_code, 6U);
+        out[6] = '\0';
+        return 0;
+    }
+    /* 参数区无效：返回默认码 */
+    memcpy(out, "123456", 6U);
+    out[6] = '\0';
+    return 0;
 }
 

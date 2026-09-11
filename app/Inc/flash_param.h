@@ -63,5 +63,10 @@ int FlashParam_RecordOpen(void);
  *   满第一千次时调用方应上报告警 */
 uint32_t FlashParam_IncEraseCnt(void);
 
+
+/* 读当前取件码到 out（至少 7 字节空间，含末尾 '\0'）
+ * 返回 0=成功 -1=失败（参数区无效时 out 填默认 "123456"）*/
+int FlashParam_GetCurrentCode(char *out, uint8_t len);
+
 #endif /* __FLASH_PARAM_H */
 

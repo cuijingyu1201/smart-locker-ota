@@ -3432,3 +3432,90 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 
 
 
+# D23(D8)：6 位取件码校验模块 + 蜂鸣器驱动（2026-09-11）
+
+阶段归属：阶段3 业务功能 · 取件码与开柜联动
+状态：编译通过，未上板测试
+
+---
+
+## 目标
+
+参考 TraeWork D8 章节要求，实现 1 柜简化版取件码校验：
+- 6 位取件码（默认 123456，存 Flash 参数区）
+- KEY0 短按 = 光标移到下一位
+- KEY1 短按 = 当前位 +1（0→9 循环）
+- PA0(WK_UP) 短按 = 确认校验
+- 正确 → 触发开柜 + 蜂鸣短响 100ms
+- 错误 → 蜂鸣长响 1 秒 + 错误计数 +1
+- 10 次错误 → 锁定 30 秒，期间所有按键无效
+
+---
+
+## 新增文件
+
+| 文件 | 作用 |
+|---|---|
+| app/Inc/app_buzzer.h | 蜂鸣器驱动接口 + 全局静音开关（APP_BUZZER_ENABLED）|
+| app/Src/app_buzzer.c | 蜂鸣器驱动实现（PB8 推挽输出 + 阻塞式短响）|
+| app/Inc/code_check.h | 取件码校验模块接口 |
+| app/Src/code_check.c | 取件码校验核心逻辑（输入/校验/锁定/状态机）|
+
+## 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| app/Inc/main.h | CubeMX 新增 PB8 BUZZER_Pin/BUZZER_GPIO_Port 宏 |
+| app/Src/gpio.c | CubeMX 新增 PB8 推挽输出初始化（Pull-up + High Speed）|
+| app/Inc/flash_param.h | 新增 FlashParam_GetCurrentCode API 声明 |
+| app/Src/flash_param.c | 新增 FlashParam_GetCurrentCode 实现（参数区无效时返回默认码 123456）+ include cmsis_os2.h |
+| app/Inc/app_task.h | TaskKeyPoll 栈 256→1024（防 printf 格式化爆栈）|
+| app/Src/cabinet_fsm.c | 新增 KEY0/KEY1 短按检测 + KEY1 短按/长按区分（短按取件码+1，长按清FAULT）|
+| app/Src/app_task.c | PA0 从直接开柜改为 CodeCheck_OnConfirm 确认 |
+| app/Src/main.c | 加 CodeCheck_Init 初始化调用（FlashParam_InitOnBoot 之后）+ include |
+
+---
+
+## 关键设计
+
+### 1. 蜂鸣器静音开关（app_buzzer.h）
+
+编译期开关，静音模式下 BUZZER_ON/OFF 变空操作，零运行时开销。整体调试时改回 1 即可，其他文件不用动。
+
+### 2. KEY1 短按/长按区分（cabinet_fsm.c）
+
+- 短按（<3秒）：取件码当前位 +1
+- 长按（≥3秒）：清 FAULT（D4 原有逻辑保留）
+- s_key1_long_triggered 标志防止松开时误触发短按
+
+### 3. 取件码存储（flash_param.c）
+
+- 从 static g_param_buf_internal 读，不引入 4KB 栈变量
+- 参数区无效时返回默认码 "123456"，保证全新板子也能用
+
+---
+
+## 操作流程
+
+| 步骤 | 按键 | 效果 |
+|---|---|---|
+| 1 | KEY1 短按 N 次 | 当前位数字 +N（0→9 循环）|
+| 2 | KEY0 短按 | 光标移到下一位 |
+| 3 | 重复 1-2 输入 6 位 | |
+| 4 | PA0 短按 | 确认校验 |
+| | 正确 | 开柜 + 蜂鸣短响 100ms + 清空输入 |
+| | 错误 | 蜂鸣长响 1 秒 + 清空输入 + err_cnt++ |
+| | 10 次错误 | 锁定 30 秒，期间按键无效 |
+
+---
+
+## 成果
+
+- **取件码校验模块**：6 位输入 + 10 次错误锁定 + 30 秒倒计时
+- **蜂鸣器驱动**：PB8 + 全局静音开关，编译期零开销
+- **按键短按/长按区分**：KEY1 短按取件码 +1，长按清 FAULT 不冲突
+- **Flash 参数区复用**：current_code 字段存储取件码，参数区无效时返回默认码
+
+---
+
+*参考：正点原子精英版 PDF 第 14 章蜂鸣器实验（PB8 NPN 三极管驱动）*

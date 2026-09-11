@@ -72,6 +72,8 @@ void Error_Handler(void);
 #define KEY_WKUP_EXTI_IRQn EXTI0_IRQn
 #define LED0_Pin GPIO_PIN_5
 #define LED0_GPIO_Port GPIOB
+#define BUZZER_Pin GPIO_PIN_8
+#define BUZZER_GPIO_Port GPIOB
 #define HALL_DOOR_Pin GPIO_PIN_0
 #define HALL_DOOR_GPIO_Port GPIOE
 

@@ -39,6 +39,8 @@
 #include "app_servo.h"
 #include "app_sensor.h"
 #include "app_ipc.h"
+#include "app_buzzer.h"
+#include "code_check.h"
 
 
 /* ===================== fputc 重定向（D3 第二版互斥锁，原样保留） ===================== */
@@ -136,11 +138,16 @@ int main(void)
   MX_FSMC_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+
 	App_Lcd_Init();   /* LCD 初始化（FSMC 已由 MX_FSMC_Init 初始化，此处初始化 LCD 控制器 + 背光）*/
 	App_Touch_Init();
 	App_Servo_Init();    /* 舵机 PWM 启动，默认关锁 */
 	App_Sensor_Init();   /* 霍尔/红外传感器初始化 */
+	App_Buzzer_Init();   /* 蜂鸣器初始化（关闭状态） */
 	
+	#if APP_BUZZER_ENABLED
+		App_Buzzer_Beep_Blocking(200);  /* 上电自检：响 200ms（静音模式跳过，避免无意义 200ms 延迟）*/
+	#endif	
   uart_printf_mutex("\r\n############ APP v%u.%u.%u.%u (built %s %s) ############\r\n",
                     FW_VER_MAJOR, FW_VER_MINOR, FW_VER_PATCH, FW_BUILD_NUM,
                     __DATE__, __TIME__);
@@ -150,6 +157,9 @@ int main(void)
 
 	/* Flash maintenance belongs to boot, not to a small periodic task stack. */
 	(void)FlashParam_InitOnBoot();
+	
+	 CodeCheck_Init();   /* D8：取件码模块初始化，从 Flash 读正确码 */
+
 	
   /* USER CODE END 2 */
 

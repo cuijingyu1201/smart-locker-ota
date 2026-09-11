@@ -5,6 +5,7 @@
 #include "cmsis_os2.h"
 #include "app_ipc.h"
 #include "flash_param.h" 
+#include "code_check.h"
 
 /* ============================================================
  *  D4 配置：是否启用红外取件检测
@@ -19,13 +20,14 @@
 static cabinet_state_e s_state = CAB_STATE_CLOSED;
 static fault_reason_e  s_fault = FAULT_NONE;
 static uint32_t        s_state_enter_tick = 0;   /* 进入当前态的 tick */
-
-/* 开柜请求标志（外部置 1，状态机消费后置 0） */
-static volatile uint8_t s_open_request = 0;
-
+static volatile uint8_t s_open_request = 0;/* 开柜请求标志（外部置 1，状态机消费后置 0） */
 /* KEY1 长按计时 */
 static uint32_t s_key1_press_tick = 0;
 static uint8_t  s_key1_was_pressed = 0;
+/* KEY0 短按消抖 */
+static uint32_t s_key0_press_tick = 0;
+static uint8_t  s_key0_was_pressed = 0;
+static uint8_t  s_key1_long_triggered = 0;/* KEY1 长按标志（区分短按/长按，短按=取件码+1，长按=清FAULT）*/
 
 /* ============================================================
  *  辅助：判断 KEY1（PE3）是否按下（低电平有效）
@@ -34,6 +36,12 @@ static uint8_t key1_is_pressed(void)
 {
     /* 按下=低电平，松开=高电平（内部上拉） */
     return (HAL_GPIO_ReadPin(KEY1_GPIO_Port, KEY1_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+}
+
+/* 检测 KEY0(PE4) 是否按下（低电平有效）*/
+static uint8_t key0_is_pressed(void)
+{
+    return (HAL_GPIO_ReadPin(KEY0_GPIO_Port, KEY0_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
 }
 
 /* ============================================================
@@ -124,23 +132,50 @@ void Cabinet_FSM_Task(void *argument)
         uint32_t now = osKernelGetTickCount();
         uint32_t elapsed = now - s_state_enter_tick;
 
-        /* ====== KEY1 长按 3 秒清 FAULT ====== */
+        /* ====== KEY1 短按=取件码+1，长按3秒=清FAULT ====== */
         if (key1_is_pressed()) {
             if (!s_key1_was_pressed) {
                 s_key1_press_tick = now;
                 s_key1_was_pressed = 1;
+                s_key1_long_triggered = 0;
             } else {
                 if ((now - s_key1_press_tick) >= KEY_FAULT_CLEAR_MS) {
-                    if (s_state == CAB_STATE_FAULT) {
-                        s_fault = FAULT_NONE;
-                        fsm_transition(CAB_STATE_CLOSED);
-                        uart_printf_mutex("[CAB] KEY1 long-press: FAULT cleared.\r\n");
+                    if (s_key1_long_triggered == 0) {
+                        s_key1_long_triggered = 1;
+                        if (s_state == CAB_STATE_FAULT) {
+                            s_fault = FAULT_NONE;
+                            fsm_transition(CAB_STATE_CLOSED);
+                            uart_printf_mutex("[CAB] KEY1 long-press: FAULT cleared.\r\n");
+                        }
                     }
-                    s_key1_press_tick = now;  /* 防止重复触发 */
+                    /* 长按已触发，不重复 */
                 }
             }
         } else {
+            /* 松开瞬间：如果长按没触发 && 按下时长>=50ms → 短按 */
+            if (s_key1_was_pressed && s_key1_long_triggered == 0) {
+                uint32_t held_ms = now - s_key1_press_tick;
+                if (held_ms >= 50U) {
+                    CodeCheck_OnKey1();   /* 短按：当前位+1 */
+                }
+            }
             s_key1_was_pressed = 0;
+        }
+
+        /* ====== KEY0 短按=光标移到下一位 ====== */
+        if (key0_is_pressed()) {
+            if (!s_key0_was_pressed) {
+                s_key0_press_tick = now;
+                s_key0_was_pressed = 1;
+            }
+        } else {
+            if (s_key0_was_pressed) {
+                uint32_t held_ms = now - s_key0_press_tick;
+                if (held_ms >= 50U && held_ms < KEY_FAULT_CLEAR_MS) {
+                    CodeCheck_OnKey0();   /* 短按：光标+1 */
+                }
+            }
+            s_key0_was_pressed = 0;
         }
 
         /* ====== 状态处理 ====== */
