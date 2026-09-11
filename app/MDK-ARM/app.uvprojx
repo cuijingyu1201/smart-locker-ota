@@ -635,6 +635,11 @@
               <FileType>1</FileType>
               <FilePath>..\Src\code_check.c</FilePath>
             </File>
+            <File>
+              <FileName>lcd_ui.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Src\lcd_ui.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

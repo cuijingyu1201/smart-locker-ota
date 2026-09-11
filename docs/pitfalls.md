@@ -3519,3 +3519,166 @@ D14：Qt6 上位机 4 Tab 骨架 + Sensor Monitor QPainter 实时曲线（2026-0
 ---
 
 *参考：正点原子精英版 PDF 第 14 章蜂鸣器实验（PB8 NPN 三极管驱动）*
+
+
+
+
+# D24(D9)：LCD 触屏 UI 框架 + 主页面实现（2026-09-11）
+
+阶段归属：阶段3 业务功能 · LCD 触屏 UI
+
+---
+
+## 目标
+
+参考 TraeWork D9 章节要求，在 STM32 板载 2.8 寸 LCD（ILI9341 + XPT2046 触摸）上实现主页面，替代 Qt 上位机的柜态监控界面：
+
+- 新建 `TaskLcdUI` 任务（优先级 Normal，栈 4096 字节）
+- 新建 `lcd_ui.c/h` 框架：定义 `ui_page_e` 枚举（4 个页面对应 Qt 的 4 个 Tab）
+- 主页面（PAGE_MAIN）布局：
+  1. 顶部标题「Locker CTRL v1.0.0」
+  2. 中间 120×120 状态矩形（绿=CLOSED / 红=OPEN / 灰=FAULT）
+  3. 左侧温湿度数字
+  4. 右侧红外物品状态
+  5. 底部【OPEN】触摸按钮（160×50，居中）
+
+---
+
+## 新增文件
+
+| 文件 | 作用 |
+|---|---|
+| app/Inc/lcd_ui.h | UI 框架接口：页面枚举 + 任务参数 + API 声明 |
+| app/Src/lcd_ui.c | UI 实现：主页面绘制 + 触摸扫描 + 状态刷新 |
+
+## 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| app/Src/freertos.c | 加 TaskLcdUI 任务创建 + 注释 TaskLcdTest/TaskTouch + include lcd_ui.h |
+| app/Src/main.c | 加 LcdUI_Init 初始化调用 + include lcd_ui.h |
+
+---
+
+## 关键设计
+
+### 1. 页面框架（lcd_ui.h）
+
+```c
+typedef enum {
+    PAGE_MAIN = 0,   /* 主页面：柜态监控 */
+    PAGE_MQTT,       /* MQTT 控制台（D10 实现）*/
+    PAGE_OTA,        /* OTA 升级（D11 实现）*/
+    PAGE_SETTING,    /* 系统设置（D12 实现）*/
+    PAGE_MAX
+} ui_page_e;
+```
+
+
+### 2. 主页面布局（240×320 竖屏）
+
+```
++------------------------+ y=0
+| Locker CTRL v1.0.0     | 标题栏
+| Status Monitor         |
++------------------------+ y=45
+|Temp:22C|        |Item: | 状态矩形（120×120）
+|Humi:57%| CLOSED  |YES   | 居中 x=60~180
+|        | (绿)    |      |        y=45~165
+|        |         |      |
++--------+---------+------+
+|                        |
+|       [  OPEN  ]       | 触摸按钮 x=40~200
+|                        |           y=250~300
++------------------------+ y=320
+```
+
+### 3. 状态矩形颜色同步（lcd_ui.c）
+
+```c
+switch (state) {
+    case CAB_STATE_CLOSED:        box_color = GREEN;  state_str = "CLOSED"; break;
+    case CAB_STATE_OPENING:
+    case CAB_STATE_WAIT_PICKUP:
+    case CAB_STATE_TIMEOUT_CLOSING: box_color = RED;  state_str = "OPEN";   break;
+    case CAB_STATE_FAULT:          box_color = GRAY;  state_str = "FAULT";   break;
+}
+```
+
+只在状态变化时重绘矩形（`s_last_drawn_state` 缓存上次状态），避免每帧刷屏导致闪烁。
+
+### 4. 触摸按钮检测（lcd_ui.c）
+
+```c
+#define BTN_OPEN_X1  40   /* 开柜按钮区域 */
+#define BTN_OPEN_X2  200
+#define BTN_OPEN_Y1  250
+#define BTN_OPEN_Y2  300
+
+static uint8_t IsTouchInOpenBtn(uint16_t x, uint16_t y) {
+    return (x >= BTN_OPEN_X1 && x <= BTN_OPEN_X2 &&
+            y >= BTN_OPEN_Y1 && y <= BTN_OPEN_Y2) ? 1U : 0U;
+}
+```
+
+边沿检测：`last_touch_state` 确保只在按下瞬间触发一次开柜，松开不重复触发。
+
+### 5. 任务架构（freertos.c）
+
+```
+TaskLcdUI（4096B，Normal）
+  ├─ 20ms 轮询触摸 tp_scan(0)
+  ├─ 检测开柜按钮触摸 → Cabinet_FSM_OpenRequest()
+  └─ 状态刷新 DrawPageMain(state, 0)
+       ├─ 状态变化 → 重绘矩形
+       ├─ 2 秒到期 → 刷新温湿度
+       └─ force_redraw=0 → 其他区域不刷
+```
+
+替代了 TaskLcdTest（D4 的 LED 闪烁测试）+ TaskTouch（D4 的触摸坐标打印），两者逻辑合并进 TaskLcdUI。
+
+---
+
+## 操作流程
+
+| 步骤 | 操作 | 效果 |
+|---|---|---|
+| 1 | 上电 | LCD 显示主页面，状态矩形绿色 CLOSED |
+| 2 | 摸【OPEN】按钮 | 舵机开柜，矩形 绿→红，文字 CLOSED→OPEN |
+| 3 | 等 5 秒不关门 | 超时自动关门，矩形 红→绿 |
+| 4 | 摸屏幕其他位置 | 串口打印 Touch 坐标，不触发开柜 |
+| 5 | 开柜后连续摸按钮 | 串口打印 IGNORED，不重复触发 |
+
+---
+
+## 测试结果（2026-09-11 上板验证）
+
+| 测试项 | 结果 | 证据 |
+|---|---|---|
+| 摸按钮开柜 | ✅ 通过 | Touch(170,262) → OPEN button → CLOSED→OPENING→WAIT_PICKUP |
+| 状态矩形颜色同步 | ✅ 通过 | CLOSED(绿) → OPENING(红) → TIMEOUT_CLOSING → CLOSED(绿) |
+| 温湿度刷新 | ✅ 通过 | 每 2 秒刷新，与 DHT11 串口打印一致 |
+| 按钮范围识别 | ✅ 通过 | 按钮外触摸只打印坐标不触发开柜 |
+| 连续摸不误触发 | ✅ 通过 | 开柜后连续 6 次摸按钮全部 IGNORED(state=2) |
+| 栈余量 | ✅ 充足 | TaskLcdUI free=3768B / total=4096B |
+| 状态机完整链路 | ✅ 通过 | CLOSED→OPENING→WAIT_PICKUP→TIMEOUT_CLOSING→CLOSED 全走通 |
+
+---
+
+## 成果
+
+- **LCD 触屏 UI 框架**：4 页面枚举 + 任务架构 + 页面切换 API，为 D10-D12 预留扩展点
+- **主页面实现**：状态矩形 + 温湿度 + 物品状态 + 开柜触摸按钮，完整替代 Qt 主界面
+- **状态实时同步**：柜门状态机跳变时 LCD 矩形颜色和文字同步变化
+- **触摸按钮交互**：边沿检测 + 范围判断，按下一次触发一次开柜，不重复不误触
+- **任务合并优化**：TaskLcdTest + TaskTouch 合并进 TaskLcdUI，减少 2 个任务开销
+
+---
+
+*硬件：正点原子精英版 STM32F103ZET6 + 2.8 寸 LCD（ILI9341 FSMC + XPT2046 触摸）*
+
+
+
+
+
+

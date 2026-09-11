@@ -36,6 +36,7 @@
 #include "app_servo.h"
 #include "app_sensor.h"
 #include "app_locker_test.h"
+#include "lcd_ui.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -247,42 +248,63 @@ void MX_FREERTOS_Init(void) {
         App_StackMonitorRegister(taskESP8266_handle, "TaskESP8266",
                                  taskESP8266_attr.stack_size);
     }
-		/* -------------------- TaskLcd -------------------- */
+//		/* -------------------- TaskLcd -------------------- */
+//    {
+//        const osThreadAttr_t taskLcdTest_attr = {
+//            .name       = "TaskLcdTest",
+//            .attr_bits  = osThreadDetached,
+//            .cb_mem     = NULL,
+//            .cb_size    = 0,
+//            .stack_mem  = NULL,
+//            .stack_size = TASK_LCD_TEST_STACK_SIZE_BYTES,
+//            .priority   = TASK_LCD_TEST_PRIORITY,
+//            .tz_module  = 0,
+//            .reserved   = 0
+//        };
+//        osThreadId_t taskLcdTest_handle = osThreadNew(TaskLcdTest, NULL, &taskLcdTest_attr);
+//        if (taskLcdTest_handle == NULL) {
+//            uart_printf_mutex("[ERROR] osThreadNew(TaskLcdTest) failed!\r\n");
+//        } else {
+//            App_StackMonitorRegister(taskLcdTest_handle, "TaskLcdTest",
+//                                     taskLcdTest_attr.stack_size);
+//        }
+//    }
+		/* -------------------- TaskLcdUI  -------------------- */
     {
-        const osThreadAttr_t taskLcdTest_attr = {
-            .name       = "TaskLcdTest",
+        const osThreadAttr_t taskLcdUI_attr = {
+            .name       = "TaskLcdUI",
             .attr_bits  = osThreadDetached,
             .cb_mem     = NULL,
             .cb_size    = 0,
             .stack_mem  = NULL,
-            .stack_size = TASK_LCD_TEST_STACK_SIZE_BYTES,
-            .priority   = TASK_LCD_TEST_PRIORITY,
+            .stack_size = TASK_LCD_UI_STACK_SIZE_BYTES,
+            .priority   = TASK_LCD_UI_PRIORITY,
             .tz_module  = 0,
             .reserved   = 0
         };
-        osThreadId_t taskLcdTest_handle = osThreadNew(TaskLcdTest, NULL, &taskLcdTest_attr);
-        if (taskLcdTest_handle == NULL) {
-            uart_printf_mutex("[ERROR] osThreadNew(TaskLcdTest) failed!\r\n");
+        osThreadId_t taskLcdUI_handle = osThreadNew(TaskLcdUI, NULL, &taskLcdUI_attr);
+        if (taskLcdUI_handle == NULL) {
+            uart_printf_mutex("[ERROR] osThreadNew(TaskLcdUI) failed!\r\n");
         } else {
-            App_StackMonitorRegister(taskLcdTest_handle, "TaskLcdTest",
-                                     taskLcdTest_attr.stack_size);
+            App_StackMonitorRegister(taskLcdUI_handle, "TaskLcdUI",
+                                     taskLcdUI_attr.stack_size);
         }
     }
-		/* -------------------- TaskTouch -------------------- */
-		{
-				const osThreadAttr_t taskTouch_attr = {
-						.name       = "TaskTouch",
-						.attr_bits  = osThreadDetached,
-						.stack_size = TASK_TOUCH_STACK_SIZE_BYTES,
-						.priority   = TASK_TOUCH_PRIORITY,
-				};
-				osThreadId_t taskTouch_handle = osThreadNew(TaskTouch, NULL, &taskTouch_attr);
-				if (taskTouch_handle == NULL) {
-						uart_printf_mutex("[ERROR] osThreadNew(TaskTouch) failed!\r\n");
-				} else {
-						App_StackMonitorRegister(taskTouch_handle, "TaskTouch", taskTouch_attr.stack_size);
-				}
-		}
+//		/* -------------------- TaskTouch -------------------- */
+//		{
+//				const osThreadAttr_t taskTouch_attr = {
+//						.name       = "TaskTouch",
+//						.attr_bits  = osThreadDetached,
+//						.stack_size = TASK_TOUCH_STACK_SIZE_BYTES,
+//						.priority   = TASK_TOUCH_PRIORITY,
+//				};
+//				osThreadId_t taskTouch_handle = osThreadNew(TaskTouch, NULL, &taskTouch_attr);
+//				if (taskTouch_handle == NULL) {
+//						uart_printf_mutex("[ERROR] osThreadNew(TaskTouch) failed!\r\n");
+//				} else {
+//						App_StackMonitorRegister(taskTouch_handle, "TaskTouch", taskTouch_attr.stack_size);
+//				}
+//		}
 		/* -------------------- TaskLocker (柜子状态机) -------------------- */
 		{
 				const osThreadAttr_t taskLocker_attr = {

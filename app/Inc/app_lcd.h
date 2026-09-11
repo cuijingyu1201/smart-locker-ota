@@ -61,5 +61,6 @@ void App_Lcd_Unlock(void);
  * @param  argument 未使用
  */
 void TaskLcdTest(void *argument);
+/* TaskLcdUI 由 lcd_ui.h 声明，这里保留 TaskLcdTest 声明供 freertos.c 兼容 */
 
 #endif /* APP_LCD_H */

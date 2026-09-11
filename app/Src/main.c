@@ -41,6 +41,7 @@
 #include "app_ipc.h"
 #include "app_buzzer.h"
 #include "code_check.h"
+#include "lcd_ui.h"
 
 
 /* ===================== fputc 重定向（D3 第二版互斥锁，原样保留） ===================== */
@@ -158,7 +159,8 @@ int main(void)
 	/* Flash maintenance belongs to boot, not to a small periodic task stack. */
 	(void)FlashParam_InitOnBoot();
 	
-	 CodeCheck_Init();   /* D8：取件码模块初始化，从 Flash 读正确码 */
+	 CodeCheck_Init();   /* 取件码模块初始化，从 Flash 读正确码 */
+	 LcdUI_Init();   /* D9：LCD UI 初始化，画第一帧 */
 
 	
   /* USER CODE END 2 */
