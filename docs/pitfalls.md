@@ -3681,4 +3681,118 @@ TaskLcdUI（4096B，Normal）
 
 
 
+# D25(D10)：取件码加载 Bug 修复 + 蜂鸣非阻塞 + MQTT Broker 切换（2026-09-12）
+
+阶段归属：阶段3 业务功能 · 取件码校验修复与通信恢复
+状态：编译通过，已上板测试通过
+
+
+### 1. 取件码加载 Bug 修复（code_check.c）
+
+数组从 6 字节改为 7 字节，留终止符空间：
+
+```c
+/* 修复前 */
+static char s_correct_code[CODE_LEN];                          /* 6 字节 */
+FlashParam_GetCurrentCode(s_correct_code, CODE_LEN);           /* 传 6，函数返回 -1 */
+
+/* 修复后 */
+static char s_correct_code[CODE_LEN + 1];                      /* 7 字节 */
+if (FlashParam_GetCurrentCode(s_correct_code, (uint8_t)(CODE_LEN + 1U)) != 0) {
+    memcpy(s_correct_code, "123456", CODE_LEN);
+    s_correct_code[CODE_LEN] = '\0';
+    uart_printf_mutex("[CODE] WARN: use default code 123456.\r\n");
+} else {
+    uart_printf_mutex("[CODE] Init. correct code=%s loaded from Flash.\r\n", s_correct_code);
+}
+```
+
+不改 Flash 层（`FlashParam_GetCurrentCode` 的 `len < 7` 检查是合理的，它要写终止符，调用方应该传 7）。
+
+### 2. 蜂鸣非阻塞（code_check.c + lcd_ui.c）
+
+用 `s_beep_until_tick` 记录关蜂鸣的时刻，`TaskLcdUI` 主循环每 20ms 查一次：
+
+```c
+/* code_check.c - 静态变量 */
+static uint32_t s_beep_until_tick = 0;   /* 0=空闲，非0=到该 tick 关蜂鸣 */
+
+/* code_check.c - OnConfirm 里替代 osDelay */
+BUZZER_ON();
+s_beep_until_tick = osKernelGetTickCount() + CODE_BEEP_OK_MS;   /* 正确 100ms */
+/* 不再 osDelay，立即返回，LCD 继续刷新 */
+
+/* code_check.c - 新增轮询函数 */
+void CodeCheck_BeepPoll(void)
+{
+    if (s_beep_until_tick != 0U && osKernelGetTickCount() >= s_beep_until_tick) {
+        BUZZER_OFF();
+        s_beep_until_tick = 0U;
+    }
+}
+
+/* lcd_ui.c - TaskLcdUI 主循环 */
+CodeCheck_BeepPoll();   /* 每 20ms 查一次，到时间关蜂鸣 */
+osDelay(20);
+```
+
+蜂鸣期间 LCD 正常刷新（状态条变化、触摸响应），不再卡顿。
+
+### 3. MQTT Broker 切换（app_esp8266.c）
+
+```c
+/* 修复前 - 被运营商阻断 */
+#define ESP_TCP_SERVER_IP   "broker.emqx.io"
+
+/* 修复后 - Mosquitto 公共 broker */
+#define ESP_TCP_SERVER_IP   "test.mosquitto.org"
+```
+
+端口 1883 不用改（Mosquitto 也是明文 1883）。板子订阅 `iot/cab001/cmd`，发布 `iot/cab001/status`，MQTTX 连 Mosquitto 后订阅 `iot/cab001/#` 即可通信。
+
+---
+
+## 操作流程
+
+| 步骤 | 操作 | 效果 |
+|---|---|---|
+| 1 | 上电 | 串口打印 `[CODE] Init. correct code=123456 loaded from Flash.` |
+| 2 | 触摸键盘输入 123456 | 取件码框显示 `123456`，光标消失 |
+| 3 | 按 OK 键 | 串口打印 `CONFIRM OK! Unlocking cabinet.` |
+| 4 | | 蜂鸣短响 100ms（不卡 LCD） |
+| 5 | | 舵机解锁 `SERVO UNLOCK(pulse=1500us)` |
+| 6 | | 状态条变红 UNLOCKED |
+| 7 | 等 30 秒不关门 | 超时自动回锁，状态条回绿 LOCKED |
+| 8 | 输入错误码按 OK | 蜂鸣长响 1s（不卡 LCD），输入框清空，err_cnt+1 |
+
+---
+
+## 测试结果（2026-09-12 上板验证）
+
+| 测试项 | 结果 | 证据 |
+|---|---|---|
+| 密码加载 | ✅ 通过 | `[CODE] Init. correct code=123456 loaded from Flash.` |
+| 输入密码按OK开柜 | ✅ 通过 | `CONFIRM OK! Unlocking cabinet.` → `SERVO UNLOCK` → `CLOSED→OPENING→WAIT_PICKUP` |
+| 蜂鸣不卡 LCD | ✅ 通过 | 蜂鸣期间 DHT11/MQTT 日志连续打印无中断 |
+| 状态机闭环 | ✅ 通过 | `CLOSED→OPENING→WAIT_PICKUP→TIMEOUT_CLOSING→CLOSED` |
+| MQTT 连接 | ✅ 通过 | `test.mosquitto.org:1883` CONNACK success + SUBACK success |
+| MQTT 状态上报 | ✅ 通过 | 每 5 秒 `TX PUBLISH iot/cab001/status (82 bytes)` |
+| MQTT 远程开柜 | ✅ 通过 | MQTTX 发 `{"cmd":"open"}` → 舵机解锁 |
+| 栈余量 | ✅ 充足 | TaskLcdUI free=3740B / total=4096B |
+
+---
+
+## 成果
+
+- **取件码加载 Bug 修复**：`s_correct_code` 数组扩到 7 字节 + 调用传 `CODE_LEN+1` + 返回值检查 + 日志打印实际密码，密码校验链路完全打通
+- **蜂鸣非阻塞**：`osDelay` 阻塞 → `s_beep_until_tick` + `CodeCheck_BeepPoll` 轮询，蜂鸣期间 LCD 正常刷新、触摸正常响应
+- **MQTT Broker 切换**：`broker.emqx.io` → `test.mosquitto.org`，绕过运营商对 EMQX 的应用层阻断，MQTT 通信恢复正常
+
+---
+
+*参考：FlashParam_GetCurrentCode 定义在 flash_param.c:345，CODE_LEN 定义在 code_check.h:20*
+
+
+
+
 

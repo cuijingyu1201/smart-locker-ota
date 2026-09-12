@@ -15,7 +15,7 @@
 /* ==================== 可配置参数 ==================== */
 #define ESP_WIFI_SSID       "cai"        /*  2.4G WiFi 名（不能是 5G！） */
 #define ESP_WIFI_PASSWORD   "ccc1234567"     /*  WiFi 密码 */
-#define ESP_TCP_SERVER_IP   "broker.emqx.io"         /* 改成电脑在同一个 WiFi 的 IPv4 地址 */
+#define ESP_TCP_SERVER_IP   "test.mosquitto.org"     /* Mosquitto 公共 broker（emqx.io 1883/8883 被运营商阻断） */
 #define ESP_TCP_SERVER_PORT 1883                      /* NetAssist 开的 TCP Server 端口 */
 #define MQTT_CLIENT_ID      "stm32_dev138"       /* Client ID，必须全局唯一！ */
 #define MQTT_TOPIC_STATUS   "iot/cab001/status"  /* 上行：柜态上报 */

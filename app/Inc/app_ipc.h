@@ -8,6 +8,7 @@
 
 /* ===== 事件位宏（EventGroup 的 32 位标志位，每位代表一个事件） ===== */
 #define BIT_KEY_DOWN   (1U << 0U)   /* BIT0 = 1 表示 WK_UP 按键被按住 */
+#define BIT_MQTT_LOG_REFRESH  (1U << 1U)   /* BIT1 = 1 表示 MQTT 日志有新消息，TaskLcdUI 需刷新 */  
 
 /* ===== 队列消息结构体（TaskLED 生产 → TaskPrint 消费） ===== */
 typedef struct {
