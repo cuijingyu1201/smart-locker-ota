@@ -14,11 +14,14 @@
 /* ============================================================
  *  static state (BSS, no stack pressure)
  * ============================================================ */
-static ui_page_e s_current_page = PAGE_MQTT;  /* D10 test: MQTT default, revert later */
+static ui_page_e s_current_page = PAGE_MAIN;  
 static cabinet_state_e s_last_drawn_state = (cabinet_state_e)0xFF;
 static uint32_t s_last_temp_tick = 0;
 static uint8_t  s_mqtt_page_drawn = 0;
 static uint8_t  s_main_page_drawn = 0;
+static item_state_e s_last_item_state = (item_state_e)0xFF;  /* item box redraw cache */
+static uint8_t  s_ota_page_drawn = 0;                        /* OTA page redraw cache */
+static uint8_t  s_setting_page_drawn = 0;                    /* Setting page redraw cache */
 
 /* MQTT page redraw cache: only refresh regions whose content changed,
  * avoids flicker and wasted FSMC bandwidth at the 20ms refresh rate */
@@ -31,11 +34,22 @@ static uint16_t s_cursor_x = 0;
 static uint8_t  s_bar_kind = 0xFF;   /* 0 LOCKED / 1 UNLOCKED / 2 FAULT / 3 CODE-LOCK */
 static uint32_t s_bar_secs = 0xFFFFFFFFU;
 
-/* ===== PAGE_MAIN: OPEN button ===== */
-#define BTN_OPEN_X1    40
-#define BTN_OPEN_X2    200
-#define BTN_OPEN_Y1    250
-#define BTN_OPEN_Y2    300
+/* ===== PAGE_MAIN: bottom 3 nav buttons =====
+ * 3 buttons * 66px wide + 2 * 12px gap = 222px
+ * left/right margin = (240-222)/2 = 9px
+ */
+#define BTN_Y1          250
+#define BTN_Y2          300
+#define BTN_H           50
+
+#define BTN_PICKUP_X1   9
+#define BTN_PICKUP_X2   75
+
+#define BTN_OTA_X1      87
+#define BTN_OTA_X2      153
+
+#define BTN_SETTING_X1  165
+#define BTN_SETTING_X2  231
 
 /* ===== PAGE_MQTT: enlarged 3x4 keypad =====
  * Screen 240x320 vertical budget:
@@ -83,51 +97,45 @@ static void Ui_TextOnBg(uint16_t x, uint16_t y, uint8_t size,
 }
 
 /* ============================================================
- *  PAGE 1: main status page
+ *  PAGE 1: main status page (Smart-Locker layout)
+ *  Layout (240x320):
+ *    y5   title "Smart-Locker"
+ *    y28  separator
+ *    y35  "Temp" label / y55  temp value (red 16px)
+ *    y35  "Humi" label / y55  humi value (blue 16px)
+ *    y80  dashed separator
+ *    y90  "Cabinet Item" label
+ *    y110 item color box (200x50) green=YES / gray=NO
+ *    y250 three nav buttons: [Pickup][OTA][Setting]
  * ============================================================ */
 static void DrawPageMain(uint8_t force_redraw, cabinet_state_e state)
 {
+    (void)state;   /* main page no longer shows cabinet state rectangle */
+
     if (force_redraw) {
         App_Lcd_Lock();
         lcd_clear(WHITE);
-        Ui_TextOnBg(10, 5, 16, "Locker CTRL v1.0.0", BLACK, WHITE);
-        Ui_TextOnBg(10, 25, 12, "Status Monitor", GRAY, WHITE);
+
+        /* title: "Smart-Locker" 12 chars * 8px = 96, center = (240-96)/2 = 72 */
+        Ui_TextOnBg(72, 5, 16, "Smart-Locker", BLACK, WHITE);
+
+        /* separator line */
+        lcd_draw_hline(20, 28, 200, GRAY);
+
+        /* temp/humi labels */
+        Ui_TextOnBg(30, 35, 12, "Temp", GRAY, WHITE);
+        Ui_TextOnBg(150, 35, 12, "Humi", GRAY, WHITE);
+
+        /* dashed separator */
+        lcd_draw_hline(20, 90, 200, LGRAY);
+
+        /* item label */
+        Ui_TextOnBg(20, 100, 12, "Cabinet Item", GRAY, WHITE);
+
         App_Lcd_Unlock();
     }
 
-    uint16_t box_color;
-    const char *state_str;
-    switch (state) {
-        case CAB_STATE_CLOSED:
-            box_color = GREEN;
-            state_str = "CLOSED";
-            break;
-        case CAB_STATE_OPENING:
-        case CAB_STATE_WAIT_PICKUP:
-        case CAB_STATE_TIMEOUT_CLOSING:
-            box_color = RED;
-            state_str = "OPEN";
-            break;
-        case CAB_STATE_FAULT:
-            box_color = GRAY;
-            state_str = "FAULT";
-            break;
-        default:
-            box_color = GRAY;
-            state_str = "UNKNOWN";
-            break;
-    }
-
-    if (force_redraw || s_last_drawn_state != state) {
-        App_Lcd_Lock();
-        lcd_fill(60, 45, 180, 165, box_color);
-        lcd_draw_rectangle(60, 45, 180, 165, BLACK);
-        /* 16-size glyph is 8px wide; center 6-char word in 120px box */
-        Ui_TextOnBg(80, 95, 16, state_str, WHITE, box_color);
-        App_Lcd_Unlock();
-        s_last_drawn_state = state;
-    }
-
+    /* ---- temp/humi values: refresh every 2s ---- */
     uint32_t now = osKernelGetTickCount();
     if (force_redraw || (now - s_last_temp_tick) >= 2000U) {
         s_last_temp_tick = now;
@@ -140,29 +148,50 @@ static void DrawPageMain(uint8_t force_redraw, cabinet_state_e state)
             dht.temp_int = 0;
             dht.humi_int = 0;
         }
-        char buf[32];
+        char buf[16];
         App_Lcd_Lock();
-        snprintf(buf, sizeof(buf), "Temp: %dC", dht.temp_int);
-        Ui_TextOnBg(5, 50, 12, buf, BLUE, WHITE);
-        snprintf(buf, sizeof(buf), "Humi: %d%%", dht.humi_int);
-        Ui_TextOnBg(5, 70, 12, buf, BLUE, WHITE);
+        snprintf(buf, sizeof(buf), "%dC", dht.temp_int);
+        Ui_TextOnBg(30, 55, 16, buf, RED, WHITE);
+        snprintf(buf, sizeof(buf), "%d%%", dht.humi_int);
+        Ui_TextOnBg(150, 55, 16, buf, BLUE, WHITE);
         App_Lcd_Unlock();
     }
 
-    if (force_redraw) {
-        item_state_e item = App_Sensor_GetItem();
-        const char *item_str = (item == ITEM_PRESENT) ? "Item: YES" : "Item: NO";
+    /* ---- item status color box: redraw only when state changes ---- */
+    item_state_e item = App_Sensor_GetItem();
+    if (force_redraw || item != s_last_item_state) {
+        uint16_t box_color = (item == ITEM_PRESENT) ? GREEN : GRAY;
+        const char *item_str = (item == ITEM_PRESENT) ? "ITEM: YES" : "ITEM: NO";
+
         App_Lcd_Lock();
-        Ui_TextOnBg(185, 50, 12, item_str, BROWN, WHITE);
+        lcd_fill(20, 110, 220, 160, box_color);
+        lcd_draw_rectangle(20, 100, 220, 160, BLACK);
+        Ui_TextOnBg(84, 127, 16, item_str, WHITE, box_color);
         App_Lcd_Unlock();
+        s_last_item_state = item;
     }
 
+    /* ---- bottom 3 nav buttons ---- */
     if (force_redraw) {
         App_Lcd_Lock();
-        lcd_fill(BTN_OPEN_X1, BTN_OPEN_Y1, BTN_OPEN_X2, BTN_OPEN_Y2, BLUE);
-        lcd_draw_rectangle(BTN_OPEN_X1, BTN_OPEN_Y1, BTN_OPEN_X2, BTN_OPEN_Y2, BLACK);
-        /* center "OPEN" (32px) in 161px wide button -> x = 40 + 64 */
-        Ui_TextOnBg(104, 265, 16, "OPEN", BLACK, BLUE);
+        /* Pickup button (blue bg, black text) */
+        lcd_fill(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLUE);
+        lcd_draw_rectangle(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLACK);
+        /* "Pickup" 6 chars * 8 = 48, center in 66 -> x = 9 + (66-48)/2 = 18 */
+        Ui_TextOnBg(18, 267, 16, "Pickup", BLACK, BLUE);
+
+        /* OTA button (brown bg, white text) */
+        lcd_fill(BTN_OTA_X1, BTN_Y1, BTN_OTA_X2, BTN_Y2, BROWN);
+        lcd_draw_rectangle(BTN_OTA_X1, BTN_Y1, BTN_OTA_X2, BTN_Y2, BLACK);
+        /* "OTA" 3 chars * 8 = 24, center in 66 -> x = 87 + (66-24)/2 = 108 */
+        Ui_TextOnBg(108, 267, 16, "OTA", WHITE, BROWN);
+
+        /* Setting button (brown bg, white text) */
+        lcd_fill(BTN_SETTING_X1, BTN_Y1, BTN_SETTING_X2, BTN_Y2, BROWN);
+        lcd_draw_rectangle(BTN_SETTING_X1, BTN_Y1, BTN_SETTING_X2, BTN_Y2, BLACK);
+        /* "Setting" 7 chars * 8 = 56, center in 66 -> x = 165 + (66-56)/2 = 170 */
+        Ui_TextOnBg(170, 267, 16, "Setting", WHITE, BROWN);
+
         App_Lcd_Unlock();
     }
 }
@@ -252,7 +281,12 @@ static void DrawPageMqtt(uint8_t force_redraw)
         lcd_clear(WHITE);
 
         /* title + divider */
-        Ui_TextOnBg(12, 5, 16, "MQTT Console", BLACK, WHITE);
+        Ui_TextOnBg(12, 5, 16, "Pickup", BLACK, WHITE);
+        /* Back button (top-right) */
+        lcd_fill(180, 5, 230, 25, BLUE);
+        lcd_draw_rectangle(180, 5, 230, 25, BLACK);
+        Ui_TextOnBg(193, 9, 12, "Back", WHITE, BLUE);
+			
         lcd_draw_hline(12, 25, 216, GRAY);
 
         /* code label + display box */
@@ -349,12 +383,64 @@ static void DrawPageMqtt(uint8_t force_redraw)
 }
 
 /* ============================================================
+ *  PAGE 3: OTA upgrade (placeholder, D11 will implement)
+ * ============================================================ */
+static void DrawPageOta(uint8_t force_redraw)
+{
+    if (force_redraw) {
+        App_Lcd_Lock();
+        lcd_clear(WHITE);
+        Ui_TextOnBg(72, 5, 16, "OTA Upgrade", BLACK, WHITE);
+        lcd_draw_hline(20, 28, 200, GRAY);
+        Ui_TextOnBg(60, 140, 16, "Coming soon...", GRAY, WHITE);
+
+        /* back button (same pos as Pickup button) */
+        lcd_fill(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLUE);
+        lcd_draw_rectangle(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLACK);
+        Ui_TextOnBg(27, 267, 16, "Back", BLACK, BLUE);
+        App_Lcd_Unlock();
+    }
+}
+
+/* ============================================================
+ *  PAGE 4: System settings (placeholder, D12 will implement)
+ * ============================================================ */
+static void DrawPageSetting(uint8_t force_redraw)
+{
+    if (force_redraw) {
+        App_Lcd_Lock();
+        lcd_clear(WHITE);
+        Ui_TextOnBg(68, 5, 16, "Settings", BLACK, WHITE);
+        lcd_draw_hline(20, 28, 200, GRAY);
+        Ui_TextOnBg(60, 140, 16, "Coming soon...", GRAY, WHITE);
+
+        /* back button */
+        lcd_fill(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLUE);
+        lcd_draw_rectangle(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLACK);
+        Ui_TextOnBg(27, 267, 16, "Back", BLACK, BLUE);
+        App_Lcd_Unlock();
+    }
+}
+
+/* ============================================================
  *  touch hit tests
  * ============================================================ */
-static uint8_t IsTouchInOpenBtn(uint16_t x, uint16_t y)
+static uint8_t IsTouchInPickupBtn(uint16_t x, uint16_t y)
 {
-    return (x >= BTN_OPEN_X1 && x <= BTN_OPEN_X2 &&
-            y >= BTN_OPEN_Y1 && y <= BTN_OPEN_Y2) ? 1U : 0U;
+    return (x >= BTN_PICKUP_X1 && x <= BTN_PICKUP_X2 &&
+            y >= BTN_Y1 && y <= BTN_Y2) ? 1U : 0U;
+}
+
+static uint8_t IsTouchInOtaBtn(uint16_t x, uint16_t y)
+{
+    return (x >= BTN_OTA_X1 && x <= BTN_OTA_X2 &&
+            y >= BTN_Y1 && y <= BTN_Y2) ? 1U : 0U;
+}
+
+static uint8_t IsTouchInSettingBtn(uint16_t x, uint16_t y)
+{
+    return (x >= BTN_SETTING_X1 && x <= BTN_SETTING_X2 &&
+            y >= BTN_Y1 && y <= BTN_Y2) ? 1U : 0U;
 }
 
 /* return 0..11 keypad key, 0xFF = outside keypad */
@@ -378,12 +464,14 @@ static uint8_t GetKeypadKey(uint16_t x, uint16_t y)
  * ============================================================ */
 void LcdUI_Init(void)
 {
-    s_current_page = PAGE_MQTT;   /* D10 test: default MQTT page, revert later */
+    s_current_page = PAGE_MAIN;   
     s_last_drawn_state = (cabinet_state_e)0xFF;
     s_last_temp_tick = 0;
     s_mqtt_page_drawn = 0;
     s_main_page_drawn = 0;
-    uart_printf_mutex("[LCD-UI] Init. Page=MQTT (D10 test)\r\n");
+	  s_ota_page_drawn = 0;
+	  s_setting_page_drawn = 0; 
+    uart_printf_mutex("[LCD-UI] Init. Page=MAIN\r\n");
 }
 
 void LcdUI_SetPage(ui_page_e page)
@@ -393,6 +481,8 @@ void LcdUI_SetPage(ui_page_e page)
         s_last_drawn_state = (cabinet_state_e)0xFF;
         s_mqtt_page_drawn = 0;
         s_main_page_drawn = 0;
+        s_ota_page_drawn = 0;
+        s_setting_page_drawn = 0;
         uart_printf_mutex("[LCD-UI] Page switch -> %d\r\n", page);
     }
 }
@@ -411,9 +501,9 @@ void TaskLcdUI(void *argument)
     uint8_t last_touch_state = 0;
     cabinet_state_e state;
 
-    /* first frame: MQTT page (D10 test default) */
-    DrawPageMqtt(1);
-    s_mqtt_page_drawn = 1;
+    /* first frame: MAIN page */
+    DrawPageMain(1, Cabinet_FSM_GetState());
+    s_main_page_drawn = 1;
 
     uart_printf_mutex("[LCD-UI] TaskLcdUI start.\r\n");
 
@@ -426,24 +516,46 @@ void TaskLcdUI(void *argument)
             uart_printf_mutex("[LCD-UI] Touch: (%u,%u)\r\n", tx, ty);
 
             if (s_current_page == PAGE_MAIN) {
-                if (IsTouchInOpenBtn(tx, ty)) {
-                    uart_printf_mutex("[LCD-UI] OPEN button pressed!\r\n");
-                    Cabinet_FSM_OpenRequest();
+								if (IsTouchInPickupBtn(tx, ty)) {
+										uart_printf_mutex("[LCD-UI] Pickup button -> PAGE_MQTT\r\n");
+										LcdUI_SetPage(PAGE_MQTT);
+								}
+								else if (IsTouchInOtaBtn(tx, ty)) {
+										uart_printf_mutex("[LCD-UI] OTA button -> PAGE_OTA\r\n");
+										LcdUI_SetPage(PAGE_OTA);
+								}
+								else if (IsTouchInSettingBtn(tx, ty)) {
+										uart_printf_mutex("[LCD-UI] Setting button -> PAGE_SETTING\r\n");
+										LcdUI_SetPage(PAGE_SETTING);
+								}
+						}
+            else if (s_current_page == PAGE_MQTT) {
+                /* Back button: x=180~230, y=5~25 */
+                if (tx >= 180 && tx <= 230 && ty >= 5 && ty <= 25) {
+                    uart_printf_mutex("[LCD-UI] Back button -> PAGE_MAIN\r\n");
+                    LcdUI_SetPage(PAGE_MAIN);
+                }
+                else {
+                    uint8_t key = GetKeypadKey(tx, ty);
+                    if (key != 0xFFU) {
+                        uart_printf_mutex("[LCD-UI] Keypad key=%u\r\n", key);
+                        if (key <= 8U) {
+                            CodeCheck_OnDigit((uint8_t)(key + 1U));   /* keys 0..8 -> digits 1..9 */
+                        } else if (key == 9U) {
+                            CodeCheck_OnClear();                      /* C */
+                        } else if (key == 10U) {
+                            CodeCheck_OnDigit(0U);                    /* 0 */
+                        } else if (key == 11U) {
+                            CodeCheck_OnConfirm();                    /* OK */
+                        }
+                    }
                 }
             }
-            else if (s_current_page == PAGE_MQTT) {
-                uint8_t key = GetKeypadKey(tx, ty);
-                if (key != 0xFFU) {
-                    uart_printf_mutex("[LCD-UI] Keypad key=%u\r\n", key);
-                    if (key <= 8U) {
-                        CodeCheck_OnDigit((uint8_t)(key + 1U));   /* keys 0..8 -> digits 1..9 */
-                    } else if (key == 9U) {
-                        CodeCheck_OnClear();                      /* C */
-                    } else if (key == 10U) {
-                        CodeCheck_OnDigit(0U);                    /* 0 */
-                    } else if (key == 11U) {
-                        CodeCheck_OnConfirm();                    /* OK */
-                    }
+						else if (s_current_page == PAGE_OTA || s_current_page == PAGE_SETTING) {
+                /* Back button = same area as Pickup button */
+                if (IsTouchInPickupBtn(tx, ty)) {
+                    uart_printf_mutex("[LCD-UI] Back button -> PAGE_MAIN\r\n");
+                    LcdUI_SetPage(PAGE_MAIN);
                 }
             }
         }
@@ -457,6 +569,14 @@ void TaskLcdUI(void *argument)
         else if (s_current_page == PAGE_MQTT) {
             DrawPageMqtt(s_mqtt_page_drawn == 0U);
             s_mqtt_page_drawn = 1;
+        }
+        else if (s_current_page == PAGE_OTA) {
+            DrawPageOta(s_ota_page_drawn == 0U);
+            s_ota_page_drawn = 1;
+        }
+        else if (s_current_page == PAGE_SETTING) {
+            DrawPageSetting(s_setting_page_drawn == 0U);
+            s_setting_page_drawn = 1;
         }
 
         CodeCheck_BeepPoll();   /* non-blocking buzzer turn-off check */
