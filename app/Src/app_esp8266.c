@@ -11,6 +11,7 @@
 #include "ota_manager.h"   /*  OTA 请求触发层 */
 #include "cabinet_fsm.h"
 #include "app_sensor.h"
+#include "lcd_ui.h"        /* LcdUI_SetOtaCommand, LcdUI_SetPage */
 
 /* ==================== 可配置参数 ==================== */
 #define ESP_WIFI_SSID       "cai"        /*  2.4G WiFi 名（不能是 5G！） */
@@ -554,23 +555,23 @@ void TaskESP8266(void *argument)
                                             uart_printf_mutex("[MQTT] CMD: LED OFF\r\n");
                                         }
                                         else if (strstr(json_buf, "\"cmd\":\"ota\"") != NULL) {
-                                            /* D11: OTA 升级命令 */
-                                            uint16_t nm = 0, nmi = 0, np = 0, nb = 0;
-                                            uint32_t nsize = 0, ncrc = 0;
-                                            uint8_t force = 0U;
-                                            if (OTA_ParseCommand(json_buf, cp_len,
-                                                                 &nm, &nmi, &np, &nb,
-                                                                 &nsize, &ncrc, &force)) {
-                                                uart_printf_mutex("[MQTT] CMD: OTA v%u.%u.%u.%u size=%lu crc=0x%08lX force=%u\r\n",
-                                                       nm, nmi, np, nb,
-                                                       (unsigned long)nsize,
-                                                       (unsigned long)ncrc, force);
-                                                OTA_TriggerUpgrade(nm, nmi, np, nb,
-                                                                   ncrc, nsize, force);
-                                            } else {
-                                                uart_printf_mutex("[MQTT] OTA cmd parse FAIL (size/crc missing)\r\n");
-                                            }
-                                        }
+																							/* D11: OTA 升级命令 */
+																							uint16_t nm = 0, nmi = 0, np = 0, nb = 0;
+																							uint32_t nsize = 0, ncrc = 0;
+																							uint8_t force = 0U;
+																							if (OTA_ParseCommand(json_buf, cp_len,
+																																	 &nm, &nmi, &np, &nb,
+																																	 &nsize, &ncrc, &force)) {
+																									uart_printf_mutex("[MQTT] CMD: OTA v%u.%u.%u.%u size=%lu crc=0x%08lX force=%u\r\n",
+																																 nm, nmi, np, nb,
+																																 (unsigned long)nsize,
+																																 (unsigned long)ncrc, force);
+																									/* D26: 不直接升级，缓存到 LCD 让用户确认 */
+																									LcdUI_SetOtaCommand(nm, nmi, np, nb, nsize, ncrc);
+																							} else {
+																									uart_printf_mutex("[MQTT] OTA cmd parse FAIL (size/crc missing)\r\n");
+																							}
+																					}
 																			    /* D20: 远程开柜命令 */
                                         else if (strstr(json_buf, "\"cmd\":\"open\"") != NULL) {
                                             cabinet_state_e cur = Cabinet_FSM_GetState();

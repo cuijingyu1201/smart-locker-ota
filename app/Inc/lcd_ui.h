@@ -34,5 +34,10 @@ void LcdUI_SetPage(ui_page_e page);      /* 切换页面 */
 ui_page_e LcdUI_GetPage(void);           /* 获取当前页面 */
 void TaskLcdUI(void *argument);          /* UI 主任务 */
 
+/* D11: MQTT 收到 OTA 命令后调用，缓存新版本信息供 OTA 页面显示 */
+void LcdUI_SetOtaCommand(uint16_t major, uint16_t minor,
+                         uint16_t patch, uint16_t build,
+                         uint32_t size, uint32_t crc);
+
 #endif /* __LCD_UI_H */
 

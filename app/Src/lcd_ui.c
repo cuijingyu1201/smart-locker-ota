@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "lcd_ui.h"
-#include "app_lcd.h"       /* App_Lcd_Lock/Unlock */
+#include "app_lcd.h"        /* App_Lcd_Lock/Unlock */
 #include "app_uart.h"
 #include "lcd.h"            /* lcd_clear/fill/string/rectangle, g_back_color */
 #include "touch.h"          /* tp_scan/tp_dev */
@@ -9,7 +9,9 @@
 #include "app_dht11.h"      /* g_dht11_data/mutex */
 #include "app_sensor.h"     /* App_Sensor_GetItem */
 #include "flash_param.h"
-#include "code_check.h"     /* D10: soft keypad -> code input */
+#include "code_check.h"     /*  soft keypad -> code input */
+#include "ota_manager.h"    /*  OTA_TriggerUpgrade, FW_VER_* */
+
 
 /* ============================================================
  *  static state (BSS, no stack pressure)
@@ -22,6 +24,20 @@ static uint8_t  s_main_page_drawn = 0;
 static item_state_e s_last_item_state = (item_state_e)0xFF;  /* item box redraw cache */
 static uint8_t  s_ota_page_drawn = 0;                        /* OTA page redraw cache */
 static uint8_t  s_setting_page_drawn = 0;                    /* Setting page redraw cache */
+
+/* ===== PAGE_OTA: OTA upgrade state ===== */
+static uint16_t s_ota_new_major = 0;
+static uint16_t s_ota_new_minor = 0;
+static uint16_t s_ota_new_patch = 0;
+static uint16_t s_ota_new_build = 0;
+static uint32_t s_ota_new_size = 0;
+static uint32_t s_ota_new_crc = 0;
+static uint8_t  s_ota_cmd_received = 0;    /* 1=收到 MQTT OTA 命令 */
+static uint8_t  s_ota_pending = 0;         /* 1=有更新待处理，主界面 OTA 按钮变红 */
+static uint8_t  s_ota_last_result = 0xFF;  /* 0=成功 1=CRC失败 2=写Flash失败 3=超时, 0xFF=无升级 */
+static uint8_t  s_ota_btn_red = 0;         /* OTA 按钮当前是否红色（重绘缓存） */
+static uint8_t  s_ota_result_ack = 0;   /* 1=本次开机已展示过升级结果，之后显示 Ready */
+
 
 /* MQTT page redraw cache: only refresh regions whose content changed,
  * avoids flicker and wasted FSMC bandwidth at the 20ms refresh rate */
@@ -50,6 +66,14 @@ static uint32_t s_bar_secs = 0xFFFFFFFFU;
 
 #define BTN_SETTING_X1  165
 #define BTN_SETTING_X2  231
+
+/* ===== PAGE_OTA: START / ROLLBACK buttons ===== */
+#define OTA_BTN_START_X1    20
+#define OTA_BTN_START_X2    110
+#define OTA_BTN_ROLLBACK_X1 130
+#define OTA_BTN_ROLLBACK_X2 220
+/* Y 坐标复用主界面的 BTN_Y1/BTN_Y2 = 250/300 */
+
 
 /* ===== PAGE_MQTT: enlarged 3x4 keypad =====
  * Screen 240x320 vertical budget:
@@ -177,24 +201,29 @@ static void DrawPageMain(uint8_t force_redraw, cabinet_state_e state)
         /* Pickup button (blue bg, black text) */
         lcd_fill(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLUE);
         lcd_draw_rectangle(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLACK);
-        /* "Pickup" 6 chars * 8 = 48, center in 66 -> x = 9 + (66-48)/2 = 18 */
         Ui_TextOnBg(18, 267, 16, "Pickup", BLACK, BLUE);
-
-        /* OTA button (brown bg, white text) */
-        lcd_fill(BTN_OTA_X1, BTN_Y1, BTN_OTA_X2, BTN_Y2, BROWN);
-        lcd_draw_rectangle(BTN_OTA_X1, BTN_Y1, BTN_OTA_X2, BTN_Y2, BLACK);
-        /* "OTA" 3 chars * 8 = 24, center in 66 -> x = 87 + (66-24)/2 = 108 */
-        Ui_TextOnBg(108, 267, 16, "OTA", WHITE, BROWN);
 
         /* Setting button (brown bg, white text) */
         lcd_fill(BTN_SETTING_X1, BTN_Y1, BTN_SETTING_X2, BTN_Y2, BROWN);
         lcd_draw_rectangle(BTN_SETTING_X1, BTN_Y1, BTN_SETTING_X2, BTN_Y2, BLACK);
-        /* "Setting" 7 chars * 8 = 56, center in 66 -> x = 165 + (66-56)/2 = 170 */
         Ui_TextOnBg(170, 267, 16, "Setting", WHITE, BROWN);
 
         App_Lcd_Unlock();
     }
+
+    /* OTA button: red if update pending, brown otherwise
+     * 独立检测，MQTT 收到命令后 20ms 内变红，不用等 force_redraw */
+    if (force_redraw || s_ota_btn_red != s_ota_pending) {
+        uint16_t ota_bg = (s_ota_pending) ? RED : BROWN;
+        App_Lcd_Lock();
+        lcd_fill(BTN_OTA_X1, BTN_Y1, BTN_OTA_X2, BTN_Y2, ota_bg);
+        lcd_draw_rectangle(BTN_OTA_X1, BTN_Y1, BTN_OTA_X2, BTN_Y2, BLACK);
+        Ui_TextOnBg(108, 267, 16, "OTA", WHITE, ota_bg);
+        App_Lcd_Unlock();
+        s_ota_btn_red = s_ota_pending;
+    }
 }
+
 
 /* ============================================================
  *  PAGE 2: MQTT console = pickup code keypad only
@@ -383,21 +412,87 @@ static void DrawPageMqtt(uint8_t force_redraw)
 }
 
 /* ============================================================
- *  PAGE 3: OTA upgrade (placeholder, D11 will implement)
+ *  PAGE 3: OTA upgrade page
+ *  Layout (240x320):
+ *    y5   title "OTA Upgrade" + Back button (top-right)
+ *    y28  separator
+ *    y35  "Current: 1.0.0.4" (blue)
+ *    y55  "New: 1.0.0.5" (red, if received)
+ *    y75  "Size: 33336 bytes" (gray)
+ *    y90  "CRC: 0x34518D29" (gray)
+ *    y180 status text (gray=Ready / green=SUCCESS / red=FAIL)
+ *    y250 [START] [ROLLBACK] buttons
  * ============================================================ */
 static void DrawPageOta(uint8_t force_redraw)
 {
     if (force_redraw) {
         App_Lcd_Lock();
         lcd_clear(WHITE);
-        Ui_TextOnBg(72, 5, 16, "OTA Upgrade", BLACK, WHITE);
-        lcd_draw_hline(20, 28, 200, GRAY);
-        Ui_TextOnBg(60, 140, 16, "Coming soon...", GRAY, WHITE);
 
-        /* back button (same pos as Pickup button) */
-        lcd_fill(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLUE);
-        lcd_draw_rectangle(BTN_PICKUP_X1, BTN_Y1, BTN_PICKUP_X2, BTN_Y2, BLACK);
-        Ui_TextOnBg(27, 267, 16, "Back", BLACK, BLUE);
+        /* title */
+        Ui_TextOnBg(72, 5, 16, "OTA Upgrade", BLACK, WHITE);
+
+        /* Back button (top-right, same as Pickup page) */
+        lcd_fill(180, 5, 230, 25, BLUE);
+        lcd_draw_rectangle(180, 5, 230, 25, BLACK);
+        Ui_TextOnBg(193, 9, 12, "Back", WHITE, BLUE);
+
+        /* separator */
+        lcd_draw_hline(20, 28, 200, GRAY);
+
+        /* current version */
+        char buf[32];
+        snprintf(buf, sizeof(buf), "Current: %u.%u.%u.%u",
+                 FW_VER_MAJOR, FW_VER_MINOR, FW_VER_PATCH, FW_BUILD_NUM);
+        Ui_TextOnBg(10, 35, 16, buf, BLUE, WHITE);
+
+        /* new version info (if received) */
+        if (s_ota_cmd_received) {
+            snprintf(buf, sizeof(buf), "New: %u.%u.%u.%u",
+                     s_ota_new_major, s_ota_new_minor,
+                     s_ota_new_patch, s_ota_new_build);
+            Ui_TextOnBg(10, 55, 16, buf, RED, WHITE);
+            snprintf(buf, sizeof(buf), "Size: %lu bytes",
+                     (unsigned long)s_ota_new_size);
+            Ui_TextOnBg(10, 75, 12, buf, GRAY, WHITE);
+            snprintf(buf, sizeof(buf), "CRC: 0x%08lX",
+                     (unsigned long)s_ota_new_crc);
+            Ui_TextOnBg(10, 90, 12, buf, GRAY, WHITE);
+        } else {
+            Ui_TextOnBg(10, 55, 12, "No OTA command received", GRAY, WHITE);
+        }
+
+        /* status text: 升级结果只在开机后首次进入 OTA 页面时显示一次，
+         * 之后显示 Ready，避免一直显示 SUCCESS */
+        const char *status_str;
+        uint16_t status_color;
+        if (!s_ota_result_ack && s_ota_last_result != 0xFF) {
+            if (s_ota_last_result == 0) {
+                status_str = "SUCCESS";
+                status_color = GREEN;
+            } else {
+                status_str = "FAIL";
+                status_color = RED;
+            }
+            s_ota_result_ack = 1;   /* 已展示，下次显示 Ready */
+        } else {
+            status_str = "Ready";
+            status_color = GRAY;
+        }
+        Ui_TextOnBg(10, 180, 16, status_str, status_color, WHITE);
+
+        /* START button (blue bg, white text) */
+        lcd_fill(OTA_BTN_START_X1, BTN_Y1, OTA_BTN_START_X2, BTN_Y2, BLUE);
+        lcd_draw_rectangle(OTA_BTN_START_X1, BTN_Y1, OTA_BTN_START_X2, BTN_Y2, BLACK);
+        /* "START" 5 chars * 8 = 40, center in 90 -> x = 20 + (90-40)/2 = 45 */
+        Ui_TextOnBg(45, 267, 16, "START", WHITE, BLUE);
+
+        /* ROLLBACK button (brown bg, white text) */
+        lcd_fill(OTA_BTN_ROLLBACK_X1, BTN_Y1, OTA_BTN_ROLLBACK_X2, BTN_Y2, BROWN);
+        lcd_draw_rectangle(OTA_BTN_ROLLBACK_X1, BTN_Y1, OTA_BTN_ROLLBACK_X2, BTN_Y2, BLACK);
+        /* "ROLLBACK" 8 chars * 8 = 64, center in 90 -> x = 130 + (90-64)/2 = 143 */
+        Ui_TextOnBg(143, 267, 16, "ROLLBACK", WHITE, BROWN);
+
         App_Lcd_Unlock();
     }
 }
@@ -443,6 +538,19 @@ static uint8_t IsTouchInSettingBtn(uint16_t x, uint16_t y)
             y >= BTN_Y1 && y <= BTN_Y2) ? 1U : 0U;
 }
 
+/* ===== PAGE_OTA: START / ROLLBACK button hit tests ===== */
+static uint8_t IsTouchInOtaStartBtn(uint16_t x, uint16_t y)
+{
+    return (x >= OTA_BTN_START_X1 && x <= OTA_BTN_START_X2 &&
+            y >= BTN_Y1 && y <= BTN_Y2) ? 1U : 0U;
+}
+
+static uint8_t IsTouchInOtaRollbackBtn(uint16_t x, uint16_t y)
+{
+    return (x >= OTA_BTN_ROLLBACK_X1 && x <= OTA_BTN_ROLLBACK_X2 &&
+            y >= BTN_Y1 && y <= BTN_Y2) ? 1U : 0U;
+}
+
 /* return 0..11 keypad key, 0xFF = outside keypad */
 static uint8_t GetKeypadKey(uint16_t x, uint16_t y)
 {
@@ -464,13 +572,20 @@ static uint8_t GetKeypadKey(uint16_t x, uint16_t y)
  * ============================================================ */
 void LcdUI_Init(void)
 {
-    s_current_page = PAGE_MAIN;   
+    s_current_page = PAGE_MAIN;
     s_last_drawn_state = (cabinet_state_e)0xFF;
     s_last_temp_tick = 0;
     s_mqtt_page_drawn = 0;
     s_main_page_drawn = 0;
-	  s_ota_page_drawn = 0;
-	  s_setting_page_drawn = 0; 
+    s_ota_page_drawn = 0;
+    s_setting_page_drawn = 0;
+
+    /* D11: 读上次 OTA 结果，供 OTA 页面显示 */
+    flash_param_t param;
+    if (FlashParam_Load(&param) == 0) {
+        s_ota_last_result = (uint8_t)param.last_ota_result;
+    }
+
     uart_printf_mutex("[LCD-UI] Init. Page=MAIN\r\n");
 }
 
@@ -490,6 +605,22 @@ void LcdUI_SetPage(ui_page_e page)
 ui_page_e LcdUI_GetPage(void)
 {
     return s_current_page;
+}
+
+void LcdUI_SetOtaCommand(uint16_t major, uint16_t minor,
+                         uint16_t patch, uint16_t build,
+                         uint32_t size, uint32_t crc)
+{
+    s_ota_new_major = major;
+    s_ota_new_minor = minor;
+    s_ota_new_patch = patch;
+    s_ota_new_build = build;
+    s_ota_new_size  = size;
+    s_ota_new_crc   = crc;
+    s_ota_cmd_received = 1;
+  	s_ota_pending = 1;    /* 主界面 OTA 按钮变红提示 */
+    uart_printf_mutex("[LCD-UI] OTA command cached: v%u.%u.%u.%u size=%lu\r\n",
+                     major, minor, patch, build, (unsigned long)size);
 }
 
 /* ============================================================
@@ -551,13 +682,46 @@ void TaskLcdUI(void *argument)
                     }
                 }
             }
-						else if (s_current_page == PAGE_OTA || s_current_page == PAGE_SETTING) {
-                /* Back button = same area as Pickup button */
-                if (IsTouchInPickupBtn(tx, ty)) {
-                    uart_printf_mutex("[LCD-UI] Back button -> PAGE_MAIN\r\n");
-                    LcdUI_SetPage(PAGE_MAIN);
-                }
-            }
+						else if (s_current_page == PAGE_OTA) {
+								/* Back button (top-right, same as Pickup page) */
+								if (tx >= 180 && tx <= 230 && ty >= 5 && ty <= 25) {
+										uart_printf_mutex("[LCD-UI] Back button -> PAGE_MAIN\r\n");
+										LcdUI_SetPage(PAGE_MAIN);
+								}
+								/* START button */
+								else if (IsTouchInOtaStartBtn(tx, ty)) {
+										uart_printf_mutex("[LCD-UI] OTA START button pressed!\r\n");
+										if (s_ota_cmd_received) {
+												uart_printf_mutex("[LCD-UI] Triggering OTA upgrade...\r\n");
+											  s_ota_pending = 0;         
+				                s_ota_result_ack = 1;
+												OTA_TriggerUpgrade(s_ota_new_major, s_ota_new_minor,
+																					s_ota_new_patch, s_ota_new_build,
+																					s_ota_new_crc, s_ota_new_size, 0);
+										} else {
+												uart_printf_mutex("[LCD-UI] No OTA command, cannot start\r\n");
+										}
+								}
+								/* ROLLBACK button */
+								else if (IsTouchInOtaRollbackBtn(tx, ty)) {
+										uart_printf_mutex("[LCD-UI] OTA ROLLBACK button pressed!\r\n");
+										if (s_ota_cmd_received) {
+											  s_ota_pending = 0;          /* 开始升级，清除红色提示 */
+                        s_ota_result_ack = 1;       /* 本次结果已处理 */
+												/* force=1 允许降级/重装 */
+												OTA_TriggerUpgrade(s_ota_new_major, s_ota_new_minor,
+																					s_ota_new_patch, s_ota_new_build,
+																					s_ota_new_crc, s_ota_new_size, 1);
+										}
+								}
+						}
+						else if (s_current_page == PAGE_SETTING) {
+								/* Back button = same area as Pickup button */
+								if (IsTouchInPickupBtn(tx, ty)) {
+										uart_printf_mutex("[LCD-UI] Back button -> PAGE_MAIN\r\n");
+										LcdUI_SetPage(PAGE_MAIN);
+								}
+						}
         }
         last_touch_state = pressed;
 

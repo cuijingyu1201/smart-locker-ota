@@ -3792,7 +3792,149 @@ osDelay(20);
 
 *参考：FlashParam_GetCurrentCode 定义在 flash_param.c:345，CODE_LEN 定义在 code_check.h:20*
 
+# D26(D11)：LCD OTA 升级界面 + 主界面导航重设计（2026-09-13）
 
+阶段归属：阶段3 业务功能 · OTA 升级可视化与页面导航
+状态：编译通过，已上板测试通过
+
+### 1. 主界面重设计（lcd_ui.c DrawPageMain）
+
+去掉原状态矩形和 OPEN 按钮，改为「Smart-Locker」标题 + 温湿度左右分栏 + 物品状态色块 + 底部三按钮导航：
+
+```c
+/* 标题居中 */
+Ui_TextOnBg(72, 5, 16, "Smart-Locker", BLACK, WHITE);
+
+/* 温湿度左右分栏 */
+Ui_TextOnBg(30, 35, 12, "Temp", GRAY, WHITE);
+Ui_TextOnBg(30, 55, 16, buf, RED, WHITE);       /* 温度红色，2秒刷新 */
+Ui_TextOnBg(150, 35, 12, "Humi", GRAY, WHITE);
+Ui_TextOnBg(150, 55, 16, buf, BLUE, WHITE);     /* 湿度蓝色 */
+
+/* 物品状态色块（有物绿/无物灰），状态变化才重绘 */
+uint16_t box_color = (item == ITEM_PRESENT) ? GREEN : GRAY;
+lcd_fill(20, 110, 220, 160, box_color);
+Ui_TextOnBg(84, 127, 16, item_str, WHITE, box_color);
+
+/* 底部三按钮：Pickup(蓝) / OTA(棕/红) / Setting(棕) */
+```
+
+### 2. OTA 升级页面（lcd_ui.c DrawPageOta）
+
+显示当前版本 + 新版本信息 + 状态文字 + START/ROLLBACK 按钮：
+
+```c
+/* 当前版本（编译时写死） */
+snprintf(buf, sizeof(buf), "Current: %u.%u.%u.%u",
+         FW_VER_MAJOR, FW_VER_MINOR, FW_VER_PATCH, FW_BUILD_NUM);
+
+/* 新版本（MQTT 命令缓存） */
+if (s_ota_cmd_received) {
+    snprintf(buf, sizeof(buf), "New: %u.%u.%u.%u", ...);
+    /* Size / CRC */
+}
+
+/* 状态文字：Ready(灰) / SUCCESS(绿) / FAIL(红) */
+if (!s_ota_result_ack && s_ota_last_result != 0xFF) {
+    /* 显示 SUCCESS/FAIL 一次，之后显示 Ready */
+    s_ota_result_ack = 1;
+}
+
+/* START(force=0 只升不降) / ROLLBACK(force=1 允许降级重装) */
+```
+
+### 3. MQTT OTA 命令改为缓存+提示（app_esp8266.c）
+
+收到 OTA 命令不再直接升级，而是缓存到 LCD 变量，主界面 OTA 按钮变红提示用户：
+
+```c
+/* 修复前 - 收到命令立即升级 */
+OTA_TriggerUpgrade(nm, nmi, np, nb, ncrc, nsize, force);
+
+/* 修复后 - 缓存命令，不自动跳转 */
+LcdUI_SetOtaCommand(nm, nmi, np, nb, nsize, ncrc);
+/* 不调 LcdUI_SetPage，主界面 OTA 按钮自动变红 */
+```
+
+### 4. 红色提示保持逻辑（lcd_ui.c）
+
+OTA 按钮红色从「收到命令」持续到「真正点 START/ROLLBACK 升级」，中间进出页面不清除：
+
+```c
+/* OTA 按钮独立检测变色，不依赖 force_redraw */
+if (force_redraw || s_ota_btn_red != s_ota_pending) {
+    uint16_t ota_bg = (s_ota_pending) ? RED : BROWN;
+    lcd_fill(BTN_OTA_X1, BTN_Y1, BTN_OTA_X2, BTN_Y2, ota_bg);
+    s_ota_btn_red = s_ota_pending;
+}
+
+/* 点 OTA 按钮进页面不清除 s_ota_pending */
+/* 点 START/ROLLBACK 才 s_ota_pending = 0 */
+```
+
+### 5. 升级结果只显示一次（lcd_ui.c）
+
+`last_ota_result` 从 Flash 读出后永久保存，导致 OTA 页面一直显示 SUCCESS。加 `s_ota_result_ack` 标志，开机后首次进入 OTA 页面显示一次结果，之后显示 Ready：
+
+```c
+static uint8_t s_ota_result_ack = 0;   /* 1=已展示过升级结果 */
+
+if (!s_ota_result_ack && s_ota_last_result != 0xFF) {
+    status_str = (s_ota_last_result == 0) ? "SUCCESS" : "FAIL";
+    s_ota_result_ack = 1;
+} else {
+    status_str = "Ready";
+}
+```
+
+---
+
+## 操作流程
+
+| 步骤 | 操作 | 效果 |
+|---|---|---|
+| 1 | 上电 | 主界面显示 Smart-Locker + 温湿度 + 物品状态 + 三按钮 |
+| 2 | MQTTX 发 OTA 命令 | 串口打印 `OTA command cached`，主界面 OTA 按钮变红 |
+| 3 | 摸 OTA 按钮 | 进入 OTA 页面，显示当前/新版本信息，按钮仍红色 |
+| 4 | 摸 Back 返回主界面 | OTA 按钮保持红色（提示未消除） |
+| 5 | 再次摸 OTA 按钮 → 摸 START | 写参数区 → 软复位 → Bootloader 下载新固件 |
+| 6 | 新 APP 启动后进 OTA 页面 | 显示 SUCCESS（绿色，一次） |
+| 7 | 再次进 OTA 页面 | 显示 Ready（灰色） |
+| 8 | 摸 Pickup 按钮 | 进入取件码输入页 |
+| 9 | 摸 Setting 按钮 | 进入设置占位页（Coming soon） |
+
+---
+
+## 测试结果（2026-09-13 上板验证）
+
+| 测试项 | 结果 | 证据 |
+|---|---|---|
+| 主界面布局 | ✅ 通过 | Smart-Locker 标题居中 + 温湿度左右分栏 + 物品色块 + 三按钮 |
+| 温湿度刷新 | ✅ 通过 | 每 2 秒刷新，红色温度/蓝色湿度 |
+| 物品状态色块 | ✅ 通过 | 有物绿色 ITEM:YES / 无物灰色 ITEM:NO |
+| Pickup 跳转 | ✅ 通过 | 摸 Pickup → 进入取件码页 |
+| OTA 红色提示 | ✅ 通过 | MQTT 发命令后 OTA 按钮 20ms 内变红 |
+| 红色提示保持 | ✅ 通过 | 进 OTA 页再返回，按钮仍红色 |
+| OTA 页面版本显示 | ✅ 通过 | Current + New + Size + CRC 正确显示 |
+| START 触发升级 | ✅ 通过 | 写参数区 → 软复位 → Bootloader OTA |
+| 升级结果显示 | ✅ 通过 | 首次进 OTA 页显示 SUCCESS，之后显示 Ready |
+| Setting 占位页 | ✅ 通过 | Coming soon + Back 按钮 |
+| 栈余量 | ✅ 充足 | TaskLcdUI free=3740B / total=4096B |
+
+---
+
+## 成果
+
+- **主界面重设计**：Smart-Locker 标题 + 温湿度左右分栏 + 物品状态色块 + 底部三按钮导航（Pickup/OTA/Setting），去掉原状态矩形和 OPEN 按钮
+- **OTA 升级页面**：显示当前/新版本号 + 固件大小 + CRC + 升级状态（Ready/SUCCESS/FAIL）+ START/ROLLBACK 双按钮
+- **MQTT 命令缓存+提示**：收到 OTA 命令不再自动升级和跳转，主界面 OTA 按钮变红提示用户手动确认
+- **红色提示保持**：`s_ota_pending` 从收到命令持续到真正点 START/ROLLBACK，进出页面不清除
+- **升级结果单次显示**：`s_ota_result_ack` 标志确保 SUCCESS/FAIL 只在开机后首次进入 OTA 页面时显示一次，之后显示 Ready
+- **START vs ROLLBACK**：START(force=0) 只允许升级到更高版本，ROLLBACK(force=1) 允许降级/重装同版本
+
+---
+
+*参考：DrawPageOta 定义在 lcd_ui.c:421，OTA_TriggerUpgrade 定义在 ota_manager.c:132，LcdUI_SetOtaCommand 定义在 lcd_ui.c:610*
 
 
 
